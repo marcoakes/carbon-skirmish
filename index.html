@@ -14,10 +14,11 @@
 <script>
 "use strict";
 /* =====================================================================
-   CARBON SKIRMISH v4
+   CARBON SKIRMISH v7 — FLEET COMMAND
    A structural homage to CCP's open-sourced Carbon engine.
    You fly a space battleship in the spirit of the Yamato — complete
-   with a Wave Motion Gun. Hold Space. You'll know.
+   with a Wave Motion Gun — and you are the FC of a five-ship wing.
+   Your fleet shoots what you lock. Primary the logi. o7
 
    - Destiny : deterministic fixed-tick world simulation. Physics, AI,
                ballistics (transversal tracking!), webifiers, torpedoes,
@@ -73,6 +74,21 @@ const Destiny = (() => {
                shield: 110, sregen: 2.4, armor: 120, hull: 90,
                gunDmg: 11, gunRof: 1.4, gunRange: 540, pspeed: 950, track: 1.8,
                web: 260, lock: 2.4, label: 'Vesper Escort' },
+    // ---- your fleet ----
+    tackle:  { radius: 10, speed: 300, orbit: 200, inertia: 3.0,
+               shield: 60, sregen: 2.5, armor: 50, hull: 45,
+               gunDmg: 4, gunRof: 1.2, gunRange: 420, pspeed: 900, track: 2.4,
+               web: 240, label: 'tackle' },
+    dps:     { radius: 12, speed: 250, orbit: 350, inertia: 2.2,
+               shield: 90, sregen: 2.2, armor: 90, hull: 80,
+               gunDmg: 9, gunRof: 0.8, gunRange: 520, pspeed: 1000, track: 1.7, label: 'destroyer' },
+    logi:    { radius: 14, speed: 230, orbit: 380, inertia: 1.8,
+               shield: 140, sregen: 3.5, armor: 120, hull: 100,
+               repRate: 28, repRange: 560, label: 'logistics' },
+    // ---- their logistics ----
+    hlogi:   { radius: 13, speed: 220, orbit: 700, inertia: 1.6,
+               shield: 120, sregen: 3, armor: 110, hull: 90,
+               repRate: 30, repRange: 700, lock: 2.2, label: 'Blood Raider Mender' },
     cruiser: { radius: 30, speed: 90, orbit: 620, inertia: 0.7,
                shield: 560, sregen: 5, armor: 520, hull: 480,
                gunDmg: 30, gunRof: 2.6, gunRange: 920, pspeed: 800, track: 0.5,
@@ -83,15 +99,18 @@ const Destiny = (() => {
 
   const WAVES = [
     { banner: 'WAVE 1 — SCOUT PICKET',
-      sub: 'Fast, fragile. Keep your speed up and they will miss.',
-      ships: [['scout'], ['scout'], ['scout']] },
+      sub: 'Call targets — your fleet shoots what you lock.',
+      ships: [['scout'], ['scout'], ['scout'], ['scout']] },
     { banner: 'WAVE 2 — FRIGATE RESPONSE',
-      sub: 'Webifiers. If they slow you, everything starts hitting.',
-      ships: [['frigate'], ['frigate'], ['frigate'], ['scout']] },
+      sub: 'They brought a Mender. Kill the logistics FIRST.',
+      ships: [['frigate'], ['frigate'], ['frigate'], ['scout'], ['scout'], ['hlogi']] },
     { banner: 'WAVE 3 — THE SANGUINE VESPER',
-      sub: 'Heavy turrets track slowly — get close, orbit fast. Outrun her torpedoes.',
-      ships: [['cruiser', 'Sanguine Vesper'], ['escort'], ['escort']] }
+      sub: 'A Mender is keeping her alive. Primary the logi, then get under her guns.',
+      ships: [['cruiser', 'Sanguine Vesper'], ['escort'], ['escort'], ['hlogi'], ['scout'], ['scout']] }
   ];
+
+  const FLEET = [['tackle', 'Talon'], ['tackle', 'Grip'], ['dps', 'Hammer'], ['dps', 'Anvil'], ['logi', 'Mercy']];
+  const ORDERS = ['focus', 'defend', 'free', 'regroup'];
 
   let S = null;
   let nextId = 1;
@@ -111,6 +130,7 @@ const Destiny = (() => {
       gunCd: rr(0.4, (d.gunRof || 1) + 0.4), torpCd: 3,
       msl: cls === 'player' ? 6 : 0, mslCd: 0,
       bossPhase: 0, lance: null, lanceCd: 0, lanceTick: 0,
+      wing: false, aimId: null, aimT: 0, webbedT: 0, repTargetId: null, webbingId: null,
       orbitDir: rng() < 0.5 ? 1 : -1, muzzle: 1,
       alive: true, wreck: false, wreckT: 0, spin: 0
     };
@@ -131,6 +151,7 @@ const Destiny = (() => {
       beamT: 0, beamTickN: 0,
       pickups: [], score: 0, combo: 0, comboT: 0,
       overtime: false, otWave: 0, otCleared: 0, waveHullStart: 260,
+      fleetOrder: 'focus', fleetLost: [], waveWingLost: false,
       stats: { shots: 0, hits: 0, endT: 0 }
     };
     S.player = makeShip('player', 'Your Ship', 0, 0);
@@ -156,6 +177,71 @@ const Destiny = (() => {
   }
 
   const hostiles = () => S.ships.filter(s => s.alive && s.faction === 'hostile');
+  const friendlies = () => S.ships.filter(s => s.alive && s.faction === 'player');
+
+  function spawnWing(role, name) {
+    const ang = rr(0, TAU);
+    const sh = makeShip(role, name,
+      S.player.x + Math.cos(ang) * rr(120, 220), S.player.y + Math.sin(ang) * rr(120, 220));
+    sh.faction = 'player';
+    sh.wing = true;
+    S.ships.push(sh);
+    S.events.push({ type: 'warpin', x: sh.x, y: sh.y, ang: ang + Math.PI, big: false });
+    return sh;
+  }
+  function spawnFleet() { for (const [r, n] of FLEET) spawnWing(r, n); }
+
+  // sticky enemy target selection: nearest friendly, mild bias toward the FC
+  function pickAim(sh) {
+    const cur = S.ships.find(s => s.id === sh.aimId && s.alive && s.faction === 'player');
+    sh.aimT -= TICK;
+    if (cur && sh.aimT > 0) return cur;
+    sh.aimT = 3 + rng() * 2;
+    let best = null, bd = Infinity;
+    for (const f of friendlies()) {
+      let dd = Math.hypot(f.x - sh.x, f.y - sh.y);
+      if (f === S.player) dd *= 0.85;
+      if (dd < bd) { bd = dd; best = f; }
+    }
+    sh.aimId = best ? best.id : null;
+    return best;
+  }
+
+  function orbitMove(sh, t, orbit, d) {
+    const rx = t.x - sh.x, ry = t.y - sh.y;
+    const dist = Math.hypot(rx, ry) || 1;
+    const nx = rx / dist, ny = ry / dist;
+    const tx = -ny * sh.orbitDir, ty = nx * sh.orbitDir;
+    let dx, dy;
+    if (dist > orbit * 1.25)      { dx = nx * 0.9 + tx * 0.3;  dy = ny * 0.9 + ty * 0.3; }
+    else if (dist < orbit * 0.75) { dx = -nx * 0.6 + tx * 0.8; dy = -ny * 0.6 + ty * 0.8; }
+    else                          { dx = tx + nx * 0.05;       dy = ty + ny * 0.05; }
+    if (d.jink) {
+      const j = Math.sin(S.t * 2.6 + sh.id * 2.1) * d.jink;
+      const c = Math.cos(j), s2 = Math.sin(j);
+      const ndx = dx * c - dy * s2, ndy = dx * s2 + dy * c;
+      dx = ndx; dy = ndy;
+    }
+    const l = Math.hypot(dx, dy) || 1;
+    steer(sh, dx / l, dy / l, d.speed * (sh.webbedT > 0 ? 0.5 : 1), d.inertia);
+  }
+
+  // logistics: repair the most damaged friend in range (shield first, then armor)
+  function tickRepair(sh, d, friends) {
+    sh.repTargetId = null;
+    let best = null, bestFrac = 0.999;
+    for (const f of friends) {
+      if (!f.alive || f === sh) continue;
+      if (Math.hypot(f.x - sh.x, f.y - sh.y) > d.repRange) continue;
+      const frac = (f.shield + f.armor + f.hull) / (f.shieldMax + f.armorMax + f.hullMax);
+      if (frac < bestFrac) { bestFrac = frac; best = f; }
+    }
+    if (best) {
+      sh.repTargetId = best.id;
+      if (best.shield < best.shieldMax) best.shield = Math.min(best.shieldMax, best.shield + d.repRate * TICK);
+      else best.armor = Math.min(best.armorMax, best.armor + d.repRate * TICK);
+    }
+  }
 
   function applyDamage(sh, dmg, srcCls) {
     let left = dmg, layer = 'hull';
@@ -194,6 +280,10 @@ const Destiny = (() => {
       if (sh === S.player) {
         S.mode = 'dead'; S.stats.endT = S.t;
         S.deathInfo = { webbed: S.webbedBy.length > 0, src: srcCls || 'gun' };
+      } else if (sh.faction === 'player') {
+        S.fleetLost.push([sh.cls, sh.name]);
+        S.waveWingLost = true;
+        S.events.push({ type: 'wingdown', name: sh.name });
       }
       if (S.lockTargetId === sh.id) { S.lockTargetId = null; S.locked = false; S.lockProgress = 0; }
     }
@@ -329,6 +419,12 @@ const Destiny = (() => {
   function tickPlayer(cmd) {
     const p = S.player, d = CLS.player;
 
+    // fleet broadcast
+    if (cmd.order && ORDERS.indexOf(cmd.order) >= 0 && S.fleetOrder !== cmd.order) {
+      S.fleetOrder = cmd.order;
+      S.events.push({ type: 'order', order: cmd.order });
+    }
+
     // webifiers
     S.webbedBy = [];
     for (const h of hostiles()) {
@@ -440,16 +536,18 @@ const Destiny = (() => {
 
   function tickHostile(sh) {
     const d = CLS[sh.cls], p = S.player;
-    if (!p.alive) {
+    if (sh.webbedT > 0) sh.webbedT -= TICK;
+    const t = pickAim(sh);
+    if (!t) {
       steer(sh, Math.cos(sh.face), Math.sin(sh.face), d.speed * 0.35, d.inertia);
     } else {
-      const rx = p.x - sh.x, ry = p.y - sh.y;
-      const dist = Math.hypot(rx, ry) || 1;
-      const nx = rx / dist, ny = ry / dist;
+      const dist = Math.hypot(t.x - sh.x, t.y - sh.y) || 1;
+      const distP = Math.hypot(p.x - sh.x, p.y - sh.y) || 1;
 
       // ---- boss phases: the Sanguine Vesper escalates as she burns ----
+      // her heavy hardware always hunts the FC personally
       let lanceBusy = false;
-      if (sh.cls === 'cruiser') {
+      if (sh.cls === 'cruiser' && p.alive) {
         if (sh.bossPhase === 0) sh.bossPhase = 1;
         if (sh.bossPhase < 2 && sh.shield <= 1 && sh.armor < sh.armorMax * 0.5) {
           sh.bossPhase = 2;
@@ -466,9 +564,9 @@ const Destiny = (() => {
           const L = sh.lance;
           if (L.mode === 'idle') {
             sh.lanceCd -= TICK;
-            if (sh.lanceCd <= 0 && dist < 1400) {
+            if (sh.lanceCd <= 0 && distP < 1400) {
               L.mode = 'charge'; L.t = 3;
-              L.ang = Math.atan2(ry, rx);   // locked NOW — dodge by leaving the line
+              L.ang = Math.atan2(p.y - sh.y, p.x - sh.x);   // locked NOW — dodge by leaving the line
               S.events.push({ type: 'bosslance', phase: 'charge', x: sh.x, y: sh.y });
             }
           } else if (L.mode === 'charge') {
@@ -493,41 +591,75 @@ const Destiny = (() => {
         }
       }
 
-      if (lanceBusy) {
-        steer(sh, 0, 0, 0, d.inertia * 2);   // holds position, bow on the line
-      } else {
-        const tx = -ny * sh.orbitDir, ty = nx * sh.orbitDir;
-        let dx, dy;
-        if (dist > d.orbit * 1.25)     { dx = nx * 0.9 + tx * 0.3;  dy = ny * 0.9 + ty * 0.3; }
-        else if (dist < d.orbit * 0.75){ dx = -nx * 0.6 + tx * 0.8; dy = -ny * 0.6 + ty * 0.8; }
-        else                           { dx = tx + nx * 0.05;       dy = ty + ny * 0.05; }
-        if (d.jink) {
-          const j = Math.sin(S.t * 2.6 + sh.id * 2.1) * d.jink;
-          const c = Math.cos(j), s2 = Math.sin(j);
-          const ndx = dx * c - dy * s2, ndy = dx * s2 + dy * c;
-          dx = ndx; dy = ndy;
-        }
-        const l = Math.hypot(dx, dy) || 1;
-        steer(sh, dx / l, dy / l, d.speed, d.inertia);
-      }
+      if (lanceBusy) steer(sh, 0, 0, 0, d.inertia * 2);   // holds position, bow on the line
+      else orbitMove(sh, t, d.orbit, d);
 
-      sh.gunCd -= TICK;
-      if (sh.gunCd <= 0 && dist <= d.gunRange) {
-        fire(sh, p, d.gunDmg * rr(0.85, 1.15), d.pspeed, d.gunRange + 200, d.track);
-        sh.gunCd = d.gunRof * rr(0.9, 1.25);
+      if (d.gunDmg) {
+        sh.gunCd -= TICK;
+        if (sh.gunCd <= 0 && dist <= d.gunRange) {
+          fire(sh, t, d.gunDmg * rr(0.85, 1.15), d.pspeed, d.gunRange + 200, d.track);
+          sh.gunCd = d.gunRof * rr(0.9, 1.25);
+        }
       }
-      if (d.torpRof) {
+      if (d.torpRof && p.alive) {
         sh.torpCd -= TICK;
-        if (sh.torpCd <= 0 && dist < 1500) {
+        if (sh.torpCd <= 0 && distP < 1500) {
           const salvo = sh.bossPhase >= 2 ? 4 : 1;
           for (let i = 0; i < salvo; i++)
             launchTorp(sh, d, salvo > 1 ? (i - (salvo - 1) / 2) * 0.22 : 0);
           sh.torpCd = sh.bossPhase >= 2 ? 9 : d.torpRof;
         }
       }
+      if (d.repRate) tickRepair(sh, d, hostiles());
     }
     if (sh.lance && sh.lance.mode !== 'idle') sh.face = sh.lance.ang;
     else if (Math.hypot(sh.vx, sh.vy) > 5) sh.face = Math.atan2(sh.vy, sh.vx);
+    sh.shield = Math.min(sh.shieldMax, sh.shield + d.sregen * TICK);
+  }
+
+  // ---- your wingmen: obey the broadcast, shoot the called target ----
+  function tickFleet(sh) {
+    const d = CLS[sh.cls], p = S.player;
+    if (sh.webbedT > 0) sh.webbedT -= TICK;
+    const order = S.fleetOrder;
+    const hs = hostiles();
+    let tgt = null;
+    if (order !== 'regroup' && hs.length) {
+      if (order === 'focus')
+        tgt = S.ships.find(s => s.id === S.lockTargetId && s.alive && s.faction === 'hostile') || null;
+      else if (order === 'defend') {
+        let bd = Infinity;
+        for (const h of hs) {
+          const dd = Math.hypot(h.x - p.x, h.y - p.y);
+          if (dd < bd) { bd = dd; tgt = h; }
+        }
+        if (bd > 900) tgt = null;
+      }
+      if (!tgt && order !== 'defend') {
+        let bd = Infinity;
+        for (const h of hs) {
+          const dd = Math.hypot(h.x - sh.x, h.y - sh.y);
+          if (dd < bd) { bd = dd; tgt = h; }
+        }
+      }
+    }
+    // logistics anchors the FC; combat ships orbit their target
+    const anchor = (sh.cls === 'logi' || !tgt) ? p : tgt;
+    const orbitR = sh.cls === 'logi' ? 380 : !tgt ? (order === 'regroup' ? 420 : 260) : d.orbit;
+    orbitMove(sh, anchor, orbitR, d);
+
+    sh.webbingId = null;
+    if (tgt && d.gunDmg) {
+      const dist = Math.hypot(tgt.x - sh.x, tgt.y - sh.y);
+      sh.gunCd -= TICK;
+      if (sh.gunCd <= 0 && dist <= d.gunRange) {
+        fire(sh, tgt, d.gunDmg * rr(0.85, 1.15), d.pspeed, d.gunRange + 200, d.track);
+        sh.gunCd = d.gunRof * rr(0.9, 1.25);
+      }
+      if (d.web && dist <= d.web) { tgt.webbedT = 0.3; sh.webbingId = tgt.id; }
+    }
+    if (d.repRate) tickRepair(sh, d, friendlies());
+    if (Math.hypot(sh.vx, sh.vy) > 5) sh.face = Math.atan2(sh.vy, sh.vx);
     sh.shield = Math.min(sh.shieldMax, sh.shield + d.sregen * TICK);
   }
 
@@ -658,6 +790,7 @@ const Destiny = (() => {
     for (let k = 0; k < n; k++) {
       let cls = rng() < 0.45 ? 'scout' : rng() < 0.75 ? 'frigate' : 'escort';
       if (S.otWave % 3 === 0 && k === 0) cls = 'cruiser';
+      if (k === 1 && S.otWave >= 2) cls = 'hlogi';
       const ang = baseAng + k * (TAU / n) + rr(-0.35, 0.35);
       const dist = rr(1050, 1400);
       const sh = makeShip(cls, null,
@@ -688,31 +821,44 @@ const Destiny = (() => {
       S.clearedAnnounced = S.wave;
       let bonus = 500 * S.wave, sub = '+' + bonus + ' clear bonus';
       if (S.player.hull >= S.waveHullStart) { bonus += 750; sub += ' · +750 untouched hull'; }
+      if (!S.waveWingLost) { bonus += 500; sub += ' · +500 fleet intact'; }
       S.score += bonus;
       S.events.push({ type: 'banner', text: 'WAVE ' + S.wave + ' CLEARED',
         sub: sub + ' — next wave warping in' });
+      if (S.fleetLost.length) {
+        const [wr, wn] = S.fleetLost.shift();
+        spawnWing(wr, wn);
+        S.events.push({ type: 'wingback', name: wn });
+      }
     }
     if (S.overtime && S.otCleared < S.otWave) {
       S.otCleared = S.otWave;
-      const bonus = 400 + 300 * S.otWave;
+      let bonus = 400 + 300 * S.otWave;
+      if (!S.waveWingLost) bonus += 500;
       S.score += bonus;
       S.events.push({ type: 'banner', text: 'OVERTIME WAVE ' + S.otWave + ' CLEARED',
         sub: '+' + bonus + ' — more incoming' });
+      if (S.fleetLost.length) {
+        const [wr, wn] = S.fleetLost.shift();
+        spawnWing(wr, wn);
+        S.events.push({ type: 'wingback', name: wn });
+      }
     }
     S.waveDelay -= TICK;
     if (S.waveDelay <= 0) {
       if (S.overtime) spawnOvertimeWave();
       else { spawnWave(S.wave); S.wave++; S.waveHullStart = S.player.hull; }
+      S.waveWingLost = false;
       S.waveDelay = 2.8;
     }
   }
 
   function tick(cmd) {
     if (S.mode === 'intro') {
-      if (cmd.anyKey) { S.mode = 'play'; S.waveDelay = 0.4; }
+      if (cmd.anyKey) { S.mode = 'play'; S.waveDelay = 0.4; spawnFleet(); }
       return;
     }
-    if (cmd.restart) { reset(); S.mode = 'play'; S.waveDelay = 0.4; return; }
+    if (cmd.restart) { reset(); S.mode = 'play'; S.waveDelay = 0.4; spawnFleet(); return; }
     if (S.mode === 'victory' && cmd.overtime) {
       S.mode = 'play'; S.overtime = true; S.waveDelay = 1.5;
     }
@@ -724,7 +870,11 @@ const Destiny = (() => {
     for (const sh of S.ships) { sh.px = sh.x; sh.py = sh.y; }
 
     if (S.player.alive) tickPlayer(cmd);
-    for (const sh of S.ships) if (sh.alive && sh !== S.player) tickHostile(sh);
+    for (const sh of S.ships) {
+      if (!sh.alive || sh === S.player) continue;
+      if (sh.faction === 'player') tickFleet(sh);
+      else tickHostile(sh);
+    }
     for (const sh of S.ships) if (sh.alive) { sh.x += sh.vx * TICK; sh.y += sh.vy * TICK; }
     tickBeam();
     tickProjectiles();
@@ -1101,6 +1251,36 @@ const Trinity = (() => {
       x.moveTo(-0.5 * U, -0.75 * U); x.lineTo(-1.05 * U, -0.62 * U);
       x.stroke();
     }
+    else if (cls === 'tackle' || cls === 'dps' || cls === 'logi' || cls === 'hlogi') {
+      // wingmen fly Federation blue-grey; the enemy Mender is bone-and-rust
+      const hostileLogi = cls === 'hlogi';
+      const pts = (cls === 'logi' || hostileLogi)
+        ? [[1.1, 0], [0.5, 0.55], [-0.6, 0.7], [-1.0, 0.35], [-1.0, -0.35], [-0.6, -0.7], [0.5, -0.55]]
+        : cls === 'dps'
+          ? [[1.35, 0], [0.3, 0.5], [-0.3, 0.6], [-0.9, 0.85], [-0.6, 0.15], [-0.6, -0.15], [-0.9, -0.85], [-0.3, -0.6], [0.3, -0.5]]
+          : [[1.4, 0], [0.1, 0.4], [-0.75, 0.6], [-0.45, 0.08], [-0.45, -0.08], [-0.75, -0.6], [0.1, -0.4]];
+      x.save(); x.translate(0, U * 0.1);
+      poly(pts); x.fillStyle = 'rgba(0,0,0,0.5)'; x.fill(); x.restore();
+      poly(pts);
+      x.fillStyle = hostileLogi
+        ? grad(-U * 0.8, U * 0.8, [[0, '#63333c'], [0.5, '#3c1c24'], [1, '#200e13']])
+        : grad(-U * 0.8, U * 0.8, [[0, '#5d7a99'], [0.5, '#31435a'], [1, '#1a2534']]);
+      x.fill();
+      x.strokeStyle = hostileLogi ? '#c25a55' : '#7d9cbd'; x.lineWidth = U * 0.05; x.stroke();
+      // accent stripe
+      x.fillStyle = hostileLogi ? '#b8a898' : cls === 'logi' ? '#7fe0a0' : '#57d8ff';
+      poly([[1.05, 0], [0.25, 0.13], [-0.4, 0.08], [-0.4, -0.08], [0.25, -0.13]]); x.fill();
+      // engine
+      x.fillStyle = '#101820';
+      x.beginPath(); x.ellipse(-0.62 * U, 0, 0.16 * U, 0.18 * U, 0, 0, TAU); x.fill();
+      x.fillStyle = hostileLogi ? 'rgba(255,130,80,0.9)' : 'rgba(140,220,255,0.9)';
+      x.beginPath(); x.ellipse(-0.74 * U, 0, 0.06 * U, 0.1 * U, 0, 0, TAU); x.fill();
+      if (cls === 'logi' || hostileLogi) {   // medic cross
+        x.fillStyle = hostileLogi ? '#e07a72' : '#7fe0a0';
+        x.fillRect(-0.1 * U, -0.28 * U, 0.2 * U, 0.56 * U);
+        x.fillRect(-0.28 * U, -0.1 * U, 0.56 * U, 0.2 * U);
+      }
+    }
     else {   // scout / frigate / escort
       const bulky = cls !== 'scout';
       x.save(); x.translate(0, U * 0.1);
@@ -1143,7 +1323,11 @@ const Trinity = (() => {
     scout: shipSprite('scout', 26),
     frigate: shipSprite('frigate', 28),
     escort: shipSprite('escort', 28),
-    cruiser: shipSprite('cruiser', 46)
+    cruiser: shipSprite('cruiser', 46),
+    tackle: shipSprite('tackle', 25),
+    dps: shipSprite('dps', 27),
+    logi: shipSprite('logi', 30),
+    hlogi: shipSprite('hlogi', 29)
   };
   // charred wreck versions
   const WRECK = {};
@@ -1200,6 +1384,25 @@ const Trinity = (() => {
   let particles = [], floaters = [], rings = [], flashes = [], pending = [];
   let screenFlash = 0;
   let killFeed = [], banner = null, shake = 0, redFlash = 0, lockPulse = 0, zoomPulse = 0;
+  let comms = [], lowWingT = 0;
+  const pick = a => a[(Math.random() * a.length) | 0];
+  function say(line) {
+    if (comms.length && comms[0].txt === line) return;
+    comms.unshift({ txt: line, life: 7 });
+    if (comms.length > 5) comms.pop();
+  }
+  const COMMS = {
+    focus: ['Hammer > copy FC, primarying your target', 'Anvil > locked on — melting it'],
+    defend: ['Talon > forming up on you, FC', 'Grip > covering your six'],
+    free: ['Hammer > weapons free, picking targets', 'Anvil > free engage. With pleasure.'],
+    regroup: ['Mercy > fleet regrouping on the FC', 'Talon > breaking off, regrouping'],
+    kill: ['Talon > scratch one!', 'Hammer > target down', "Anvil > got 'em", 'Grip > splash one'],
+    wmg: ['Grip > HOLY HELL, FC', 'Hammer > wave motion gun! HA!'],
+    webbed: ['Talon > FC is webbed — burning the webber down'],
+    lance: ['Mercy > SPINAL LANCE — get off her line, FC!'],
+    victory: ['Mercy > grid clear. Good hunting, FC. o7']
+  };
+  const ORDER_LABEL = { focus: 'FOCUS FIRE', defend: 'DEFEND FC', free: 'FREE ENGAGE', regroup: 'REGROUP' };
   let best = 0, newRecord = false;
   try { best = parseInt(localStorage.getItem('cs_best') || '0', 10) || 0; } catch (e) {}
   const trails = new Map();
@@ -1300,7 +1503,12 @@ const Trinity = (() => {
           killFeed.unshift({ txt: e.name + ' destroyed' + (e.combo > 1 ? '  ×' + e.combo : ''), life: 5 });
           if (killFeed.length > 5) killFeed.pop();
           zoomPulse = Math.min(1, zoomPulse + 0.6);
+          if (Math.random() < 0.35) say(pick(COMMS.kill));
           break;
+        case 'order': if (COMMS[e.order]) say(pick(COMMS[e.order])); break;
+        case 'wingdown': say('Mercy > we lost ' + e.name + '!'); break;
+        case 'wingback': say(e.name + ' > back on grid, FC'); break;
+        case 'webbed': say(pick(COMMS.webbed)); break;
         case 'score':
           floaters.push({ x: e.x, y: e.y, txt: '+' + e.pts + (e.combo > 1 ? '  ×' + e.combo : ''),
             life: 1.3, col: '#ffd978', big: e.combo > 1 });
@@ -1318,12 +1526,19 @@ const Trinity = (() => {
         case 'mlaunch':
           flashes.push({ x: e.x, y: e.y, r: 26, life: 0.12, max: 0.12, img: GLOW.teal });
           break;
-        case 'banner': banner = { text: e.text, sub: e.sub, life: 4.5 }; break;
+        case 'banner':
+          banner = { text: e.text, sub: e.sub, life: 4.5 };
+          if (e.text === 'SITE SECURED') say(pick(COMMS.victory));
+          break;
         case 'lock': lockPulse = 1; break;
         case 'wmgfire':
           screenFlash = 0.55;
           shake = Math.min(34, shake + 26);
           flashes.push({ x: e.x, y: e.y, r: 260, life: 0.3, max: 0.3, img: GLOW.cyan });
+          say(pick(COMMS.wmg));
+          break;
+        case 'bosslance':
+          if (e.phase === 'charge') say(pick(COMMS.lance));
           break;
       }
     }
@@ -1357,6 +1572,7 @@ const Trinity = (() => {
 
     const spd = Math.hypot(sh.vx, sh.vy);
     const isPlayer = sh.cls === 'player';
+    const isFleet = sh.faction === 'player';
     const ab = isPlayer && S.abOn;
 
     // engine glow + exhaust cone behind hull
@@ -1366,13 +1582,13 @@ const Trinity = (() => {
       const ex = x - Math.cos(sh.face) * tail;
       const ey = y - Math.sin(sh.face) * tail;
       const eR = rPx * (0.7 + spd / 300) * (ab ? 1.9 : 1);
-      glow(ex, ey, eR, isPlayer ? (ab ? GLOW.white : GLOW.cyan) : GLOW.orange, ab ? 0.95 : 0.6);
+      glow(ex, ey, eR, isFleet ? (ab ? GLOW.white : GLOW.cyan) : GLOW.orange, ab ? 0.95 : 0.6);
       // exhaust cone
       const flick = 0.75 + Math.random() * 0.5;
       const fl = rPx * (1.2 + spd / 160) * flick * (ab ? 1.9 : 1);
       g.save(); g.translate(x, y); g.rotate(sh.face);
       const eg = g.createLinearGradient(-tail, 0, -tail - fl, 0);
-      eg.addColorStop(0, isPlayer ? (ab ? 'rgba(220,245,255,0.85)' : 'rgba(120,210,255,0.6)') : 'rgba(255,170,90,0.55)');
+      eg.addColorStop(0, isFleet ? (ab ? 'rgba(220,245,255,0.85)' : 'rgba(120,210,255,0.6)') : 'rgba(255,170,90,0.55)');
       eg.addColorStop(1, 'rgba(0,0,0,0)');
       g.fillStyle = eg;
       g.beginPath();
@@ -1390,6 +1606,7 @@ const Trinity = (() => {
     }
     // hull ambient glow
     if (isPlayer) glow(x, y, rPx * 2.6, GLOW.blue, 0.10);
+    else if (isFleet) glow(x, y, rPx * 2.1, GLOW.blue, 0.08);
     else if (sh.cls === 'cruiser') glow(x, y, rPx * 2.6, GLOW.crimson, 0.16 + 0.05 * Math.sin(now * 2.2));
     else glow(x, y, rPx * 2.1, GLOW.red, 0.09);
     g.globalCompositeOperation = 'source-over';
@@ -1454,11 +1671,13 @@ const Trinity = (() => {
       if (tr.length < 2) continue;
       const sh = S.ships.find(s => s.id === id);
       const isP = sh && sh.cls === 'player';
+      const isF = sh && sh.faction === 'player';
       const ab = isP && S.abOn;
       for (let i = 1; i < tr.length; i++) {
         const a = i / tr.length;
         g.strokeStyle = isP
           ? (ab ? 'rgba(190,235,255,' + (a * 0.6).toFixed(3) + ')' : 'rgba(90,190,255,' + (a * 0.38).toFixed(3) + ')')
+          : isF ? 'rgba(110,190,255,' + (a * 0.2).toFixed(3) + ')'
           : 'rgba(255,120,70,' + (a * 0.24).toFixed(3) + ')';
         g.lineWidth = a * (isP ? (ab ? 5.5 : 3.6) : 2.6) * scale * 2;
         g.beginPath();
@@ -1632,6 +1851,35 @@ const Trinity = (() => {
       g.lineWidth = 1;
       g.globalCompositeOperation = 'source-over';
     }
+
+    // logistics repair beams & fleet tackle webs (read-only from sim state)
+    g.globalCompositeOperation = 'lighter';
+    for (const sh of S.ships) {
+      if (!sh.alive) continue;
+      if (sh.repTargetId) {
+        const rt = S.ships.find(s => s.id === sh.repTargetId && s.alive);
+        if (rt) {
+          const x1 = w2sx(sh.x), y1 = w2sy(sh.y), x2 = w2sx(rt.x), y2 = w2sy(rt.y);
+          const friendly = sh.faction === 'player';
+          g.strokeStyle = friendly
+            ? 'rgba(120,255,150,' + (0.28 + 0.2 * Math.sin(now * 18)).toFixed(2) + ')'
+            : 'rgba(255,140,60,' + (0.28 + 0.2 * Math.sin(now * 18)).toFixed(2) + ')';
+          g.lineWidth = 2;
+          g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+          glow(x2, y2, 15, friendly ? GLOW.teal : GLOW.orange, 0.35);
+        }
+      }
+      if (sh.webbingId && sh.faction === 'player') {
+        const wt = S.ships.find(s => s.id === sh.webbingId && s.alive);
+        if (wt) {
+          g.strokeStyle = 'rgba(90,255,200,' + (0.25 + 0.15 * Math.sin(now * 26)).toFixed(2) + ')';
+          g.lineWidth = 1.4;
+          g.beginPath(); g.moveTo(w2sx(sh.x), w2sy(sh.y)); g.lineTo(w2sx(wt.x), w2sy(wt.y)); g.stroke();
+        }
+      }
+    }
+    g.lineWidth = 1;
+    g.globalCompositeOperation = 'source-over';
 
     // boss spinal lance: telegraph line during charge, red beam on fire
     for (const sh of S.ships) {
@@ -2003,9 +2251,9 @@ const Trinity = (() => {
           sctx.fillStyle = S.locked ? 'rgba(235,85,70,0.22)' : 'rgba(240,200,90,0.15)';
           sctx.fillRect(tx + 1, ry, tw - 2, 17);
         }
-        sctx.fillStyle = s.cls === 'cruiser' ? '#ff7d70' : '#d8a0a0';
+        sctx.fillStyle = s.cls === 'cruiser' ? '#ff7d70' : s.cls === 'hlogi' ? '#8be0a8' : '#d8a0a0';
         sctx.font = '11px Consolas,monospace'; sctx.textAlign = 'left';
-        sctx.fillText((s.cls === 'cruiser' ? '◆ ' : '▲ ') + s.name, tx + 8, ry + 13);
+        sctx.fillText((s.cls === 'cruiser' ? '◆ ' : s.cls === 'hlogi' ? '✚ ' : '▲ ') + s.name, tx + 8, ry + 13);
         sctx.fillStyle = '#8fa4b8'; sctx.textAlign = 'right';
         sctx.fillText(Math.round(Math.hypot(s.x - p.x, s.y - p.y)) + ' m', tx + tw - 8, ry + 13);
         overviewRows.push({ x: tx, y: ry, w: tw, h: 17, id: s.id });
@@ -2036,6 +2284,83 @@ const Trinity = (() => {
     sctx.globalAlpha = 1;
   }
 
+  function drawFleetUI(S, dtF) {
+    const now2 = performance.now() / 1000;
+    // watchlist
+    const wings = S.ships.filter(s => s.wing && s.alive);
+    const lost = S.fleetLost || [];
+    const wx = 16, rowH = 30, ww = 168;
+    const total = wings.length + lost.length;
+    if (total) {
+      const wy = Math.max(170, H * 0.26);
+      sctx.fillStyle = 'rgba(7,12,20,0.72)';
+      sctx.fillRect(wx, wy, ww, 20 + total * rowH);
+      sctx.strokeStyle = 'rgba(110,140,170,0.3)';
+      sctx.strokeRect(wx + 0.5, wy + 0.5, ww, 20 + total * rowH);
+      sctx.fillStyle = '#7d93a8'; sctx.font = 'bold 10px Consolas,monospace'; sctx.textAlign = 'left';
+      sctx.fillText('FLEET · ' + ORDER_LABEL[S.fleetOrder], wx + 8, wy + 14);
+      let ry = wy + 20;
+      for (const s2 of wings) {
+        sctx.fillStyle = s2.cls === 'logi' ? '#a8f0c0' : '#bcd4ea';
+        sctx.font = '11px Consolas,monospace'; sctx.textAlign = 'left';
+        sctx.fillText(s2.name, wx + 8, ry + 12);
+        sctx.fillStyle = '#7d93a8'; sctx.font = '9px Consolas,monospace'; sctx.textAlign = 'right';
+        sctx.fillText(CLS_LABEL[s2.cls] || s2.cls, wx + ww - 8, ry + 12);
+        sctx.textAlign = 'left';
+        const bw3 = ww - 16;
+        const mini = (yy, frac, col) => {
+          sctx.fillStyle = 'rgba(22,30,42,0.9)'; sctx.fillRect(wx + 8, yy, bw3, 3);
+          sctx.fillStyle = col; sctx.fillRect(wx + 8, yy, bw3 * clamp(frac, 0, 1), 3);
+        };
+        mini(ry + 16, s2.shield / s2.shieldMax, 'rgba(95,170,255,0.9)');
+        mini(ry + 20, s2.armor / s2.armorMax, 'rgba(235,180,90,0.9)');
+        mini(ry + 24, s2.hull / s2.hullMax, 'rgba(240,95,80,0.9)');
+        ry += rowH;
+      }
+      for (const dl of lost) {
+        sctx.fillStyle = 'rgba(160,95,95,0.85)'; sctx.font = '11px Consolas,monospace'; sctx.textAlign = 'left';
+        sctx.fillText('✝ ' + dl[1] + ' — DOWN', wx + 8, ry + 18);
+        ry += rowH;
+      }
+    }
+    // broadcast bar
+    const labels = [['1', 'FOCUS', 'focus'], ['2', 'DEFEND', 'defend'], ['3', 'FREE', 'free'], ['4', 'REGROUP', 'regroup']];
+    let bx = 16;
+    const by = H - 122;
+    for (const [k, lab, val] of labels) {
+      const active = S.fleetOrder === val;
+      const wCh = 20 + lab.length * 7;
+      sctx.fillStyle = active ? 'rgba(90,150,220,0.35)' : 'rgba(7,12,20,0.72)';
+      roundRectPath(sctx, bx, by, wCh, 20, 4); sctx.fill();
+      sctx.strokeStyle = active ? 'rgba(140,200,255,0.9)' : 'rgba(110,140,170,0.35)';
+      sctx.stroke();
+      sctx.fillStyle = active ? '#dff0ff' : '#8fa4b8';
+      sctx.font = 'bold 10px Consolas,monospace'; sctx.textAlign = 'left';
+      sctx.fillText(k + ' ' + lab, bx + 6, by + 14);
+      bx += wCh + 6;
+    }
+    // comms chatter
+    if (S.mode === 'play' && !S.paused) {
+      lowWingT -= dtF;
+      if (lowWingT <= 0) {
+        const burning = wings.find(s2 => s2.hull < s2.hullMax * 0.4);
+        if (burning) { say('Mercy > ' + burning.name + ' is burning — reps overheating!'); lowWingT = 9; }
+        else lowWingT = 1;
+      }
+    }
+    for (const c of comms) c.life -= dtF;
+    comms = comms.filter(c => c.life > 0);
+    let cy2 = H - 138;
+    for (const c of comms) {
+      sctx.globalAlpha = clamp(c.life / 2, 0, 0.95);
+      sctx.fillStyle = '#a8d8c8'; sctx.font = '11px Consolas,monospace'; sctx.textAlign = 'left';
+      sctx.fillText(c.txt, 16, cy2);
+      cy2 -= 15;
+    }
+    sctx.globalAlpha = 1;
+  }
+  const CLS_LABEL = { tackle: 'TACKLE', dps: 'DPS', logi: 'LOGI' };
+
   function drawRadar(S) {
     const p = S.player, R = 74, cx = W - R - 20, cy = H - R - 20, range = 2200;
     sctx.fillStyle = 'rgba(7,12,20,0.7)';
@@ -2059,9 +2384,15 @@ const Trinity = (() => {
     for (const s of S.ships) {
       if (!s.alive || s.faction !== 'hostile') continue;
       const [bx, by] = put(s.x, s.y);
-      sctx.fillStyle = s.id === S.lockTargetId ? '#ffdf80' : '#ff6a5a';
+      sctx.fillStyle = s.id === S.lockTargetId ? '#ffdf80' : s.cls === 'hlogi' ? '#8be0a8' : '#ff6a5a';
       if (s.cls === 'cruiser') sctx.fillRect(bx - 3, by - 3, 6, 6);
       else { sctx.beginPath(); sctx.arc(bx, by, 2.4, 0, TAU); sctx.fill(); }
+    }
+    for (const s of S.ships) {
+      if (!s.alive || !s.wing) continue;
+      const [bx, by] = put(s.x, s.y);
+      sctx.fillStyle = '#7fb8ff';
+      sctx.fillRect(bx - 1.5, by - 1.5, 3, 3);
     }
     for (const pr of S.projectiles) {
       if (pr.kind !== 'torp') continue;
@@ -2186,7 +2517,7 @@ const Trinity = (() => {
   }
 
   function drawControlCards(topY) {
-    const cw = 340, ch = 296, gap = 24;
+    const cw = 340, ch = 324, gap = 24;
     const twoCol = W > cw * 2 + gap + 40;
     const x1 = twoCol ? W / 2 - cw - gap / 2 : W / 2 - cw / 2;
     const x2 = twoCol ? W / 2 + gap / 2 : x1;
@@ -2217,15 +2548,17 @@ const Trinity = (() => {
     row(topY + 156, 'Click', 'Lock the ship you click');
     row(topY + 184, 'Space', 'Wave Motion Gun (hold)');
     row(topY + 212, 'F', 'Fire missile at locked target');
-    row(topY + 240, 'P', 'Pause   ·   R restarts');
+    row(topY + 240, '1-4', 'Fleet orders — focus/defend/free/regroup');
+    row(topY + 268, 'P', 'Pause   ·   R restarts');
 
     card(x2, y2, 'HOW TO WIN');
     const lines = [
-      ['1.', 'Lock a target. Your turrets fire on', 'their own when it is inside 520 m.'],
+      ['1.', 'You are the FC. Your fleet shoots', 'whatever target YOU lock. Call it.'],
       ['2.', 'Damage order: SHIELD → ARMOR → HULL.', 'Only your shield regenerates.'],
       ['3.', 'SPEED IS ARMOR — fast sideways motion', 'makes enemy turrets miss you.'],
-      ['4.', 'Full capacitor? HOLD SPACE to charge', 'the WAVE MOTION GUN. It erases the lane.'],
-      ['5.', 'Survive 3 waves. Kill the cruiser', 'SANGUINE VESPER to secure the site.']
+      ['4.', 'Enemy MENDERS repair their fleet.', 'Always primary the logistics first.'],
+      ['5.', 'Full capacitor? HOLD SPACE to charge', 'the WAVE MOTION GUN. It erases the lane.'],
+      ['6.', 'Survive 3 waves. Kill the cruiser', 'SANGUINE VESPER to secure the site.']
     ];
     let yy = y2 + 48;
     for (const [n, a, b] of lines) {
@@ -2526,6 +2859,7 @@ const Trinity = (() => {
       if (p.alive) { drawCapWheel(S); drawWmgStatus(S); }
       drawPanels(S);
       drawRadar(S);
+      drawFleetUI(S, dtF);
     }
     if (S.mode === 'play' && !S.paused) drawTutorial(S, dtF);
     overlay(S);
@@ -2645,6 +2979,9 @@ const Aura = (() => {
         case 'pickup': blip(880, 0.08, 'sine', 0.06, 1320, pan); blip(1320, 0.12, 'sine', 0.05, 0, pan); break;
         case 'banner': blip(340, 0.25, 'sine', 0.05, 420); break;
         case 'mlaunch': noise(0.5, 0.14, 500, 2800, pan); blip(320, 0.3, 'triangle', 0.05, 900, pan); break;
+        case 'order': blip(700, 0.07, 'sine', 0.05, 950); break;
+        case 'wingdown': blip(180, 0.5, 'sine', 0.12, 60); break;
+        case 'wingback': blip(520, 0.2, 'sine', 0.06, 780); break;
         case 'bosslance':
           if (e.phase === 'charge') blip(90, 3, 'sawtooth', 0.08, 750, pan);
           else { noise(1.4, 0.4, 1000, 60, pan); blip(58, 1.2, 'sine', 0.3, 28, pan); }
@@ -2694,7 +3031,8 @@ const Aura = (() => {
    ===================================================================== */
 const Input = (() => {
   const held = new Set();
-  let tab = false, restart = false, anyKey = false, pause = false, overtimeKey = false, missileKey = false, click = null;
+  let tab = false, restart = false, anyKey = false, pause = false, overtimeKey = false, missileKey = false, orderKey = null, click = null;
+  const ORDER_KEYS = { 1: 'focus', 2: 'defend', 3: 'free', 4: 'regroup' };
   const ALIAS = { arrowup: 'w', arrowdown: 's', arrowleft: 'a', arrowright: 'd', z: 'w', q: 'a' };
 
   window.addEventListener('keydown', e => {
@@ -2710,6 +3048,7 @@ const Input = (() => {
     if (k === 'r') restart = true;
     if (k === 'n') overtimeKey = true;
     if (k === 'f') missileKey = true;
+    if (ORDER_KEYS[k]) orderKey = ORDER_KEYS[k];
   });
   window.addEventListener('keyup', e => {
     let k = e.key.toLowerCase();
@@ -2738,6 +3077,7 @@ const Input = (() => {
       tab, restart, anyKey, pause,
       overtime: overtimeKey,
       missile: missileKey,
+      order: orderKey,
       clickWorld: null, lockId: null
     };
     if (click) {
@@ -2745,7 +3085,7 @@ const Input = (() => {
       if (id != null) cmd.lockId = id;
       else cmd.clickWorld = Trinity.screenToWorld(click.x, click.y);
     }
-    tab = false; restart = false; anyKey = false; pause = false; overtimeKey = false; missileKey = false; click = null;
+    tab = false; restart = false; anyKey = false; pause = false; overtimeKey = false; missileKey = false; orderKey = null; click = null;
     return cmd;
   }
   return { consume };

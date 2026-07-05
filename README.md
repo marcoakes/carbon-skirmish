@@ -22,6 +22,13 @@ Or play it live: **https://marcoakes.github.io/carbon-skirmish/**
 
 ## How to play
 
+You are the **Fleet Commander** of a five-ship wing — two tackle frigates (Talon,
+Grip), two destroyers (Hammer, Anvil), and the logistics cruiser Mercy, who keeps
+everyone repaired. **Your fleet shoots whatever target you lock** — call targets
+like an FC. Broadcast orders on **1–4**: focus fire, defend me, free engage, regroup.
+Enemy waves bring their own logistics ("Menders") that repair their fleet —
+**always primary the logi first**, like every EVE FC ever taught.
+
 The title screen shows every control, and your first flight walks you through them
 step by step. **P** pauses and brings the control reference back at any time.
 
