@@ -29,6 +29,12 @@ Or play it live: **https://marcoakes.github.io/carbon-skirmish/**
 - Shield recharges, armor doesn't, hull is your life. Damage flows shield → armor → hull.
 - Capacitor powers guns and afterburner and regenerates over time. Run it dry and you
   can't shoot.
+- **Speed is armor.** Turrets have tracking: the faster your transversal, the more
+  enemy shots miss. Sit still and everything hits you.
+- **Webifier frigates** slow you to half speed at close range — kill them first.
+- The cruiser's heavy turrets track slowly: get close and orbit fast to slip under her
+  guns. Her **torpedoes** home in on you — outrun them with the afterburner or cut
+  perpendicular at the last moment.
 - Clear all three waves — scouts, frigates, then the cruiser **Sanguine Vesper** and
   escorts — to secure the site. **R** restarts.
 
