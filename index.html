@@ -126,6 +126,8 @@ const Destiny = (() => {
       paused: false, clearedAnnounced: 0, waveStartT: 0, deathInfo: null,
       wmg: { charge: 0, charging: false, cd: 0 },
       beamT: 0, beamTickN: 0,
+      pickups: [], score: 0, combo: 0, comboT: 0,
+      overtime: false, otWave: 0, otCleared: 0, waveHullStart: 260,
       stats: { shots: 0, hits: 0, endT: 0 }
     };
     S.player = makeShip('player', 'Your Ship', 0, 0);
@@ -167,7 +169,24 @@ const Destiny = (() => {
       S.events.push({ type: 'boom', x: sh.x, y: sh.y, r: sh.radius, big: sh.cls === 'cruiser' });
       if (sh.faction === 'hostile') {
         S.kills++;
-        S.events.push({ type: 'kill', name: sh.name });
+        // score, with a 6-second kill-chain multiplier
+        const base = { scout: 100, frigate: 250, escort: 300, cruiser: 1500 }[sh.cls] || 100;
+        S.combo = S.comboT > 0 ? S.combo + 1 : 1;
+        S.comboT = 6;
+        const pts = base * S.combo;
+        S.score += pts;
+        S.events.push({ type: 'kill', name: sh.name, combo: S.combo });
+        S.events.push({ type: 'score', x: sh.x, y: sh.y - sh.radius - 24, pts, combo: S.combo });
+        // wrecks drop salvage worth flying into the fight for
+        if (rng() < 0.55) {
+          const roll = rng();
+          S.pickups.push({
+            type: roll < 0.4 ? 'cap' : roll < 0.8 ? 'armor' : 'wmg',
+            x: sh.x, y: sh.y, px: sh.x, py: sh.y,
+            vx: sh.vx * 0.3 + rr(-15, 15), vy: sh.vy * 0.3 + rr(-15, 15),
+            life: 12
+          });
+        }
       }
       if (sh === S.player) {
         S.mode = 'dead'; S.stats.endT = S.t;
@@ -511,20 +530,80 @@ const Destiny = (() => {
     S.ships = S.ships.filter(sh => sh.alive || sh.wreck);
   }
 
+  function tickPickups() {
+    if (S.comboT > 0) S.comboT -= TICK;
+    const p = S.player;
+    for (const pk of S.pickups) {
+      pk.px = pk.x; pk.py = pk.y;
+      pk.x += pk.vx * TICK; pk.y += pk.vy * TICK;
+      pk.life -= TICK;
+      if (pk.life <= 0) { pk.dead = true; continue; }
+      if (p.alive && Math.hypot(p.x - pk.x, p.y - pk.y) <= p.radius + 20) {
+        pk.dead = true;
+        if (pk.type === 'cap') p.cap = Math.min(p.capMax, p.cap + 40);
+        else if (pk.type === 'armor') p.armor = Math.min(p.armorMax, p.armor + 60);
+        else S.wmg.cd = Math.max(0, S.wmg.cd - 15);
+        S.events.push({ type: 'pickup', x: pk.x, y: pk.y, ptype: pk.type });
+      }
+    }
+    S.pickups = S.pickups.filter(pk => !pk.dead);
+  }
+
+  function spawnOvertimeWave() {
+    S.otWave++;
+    S.waveStartT = S.t;
+    const n = Math.min(3 + S.otWave, 8);
+    const boost = 1 + 0.07 * S.otWave;
+    const baseAng = rr(0, TAU);
+    for (let k = 0; k < n; k++) {
+      let cls = rng() < 0.45 ? 'scout' : rng() < 0.75 ? 'frigate' : 'escort';
+      if (S.otWave % 3 === 0 && k === 0) cls = 'cruiser';
+      const ang = baseAng + k * (TAU / n) + rr(-0.35, 0.35);
+      const dist = rr(1050, 1400);
+      const sh = makeShip(cls, null,
+        S.player.x + Math.cos(ang) * dist, S.player.y + Math.sin(ang) * dist);
+      sh.shield *= boost; sh.shieldMax = sh.shield;
+      sh.armor *= boost; sh.armorMax = sh.armor;
+      sh.hull *= boost; sh.hullMax = sh.hull;
+      sh.vx = -Math.cos(ang) * 220; sh.vy = -Math.sin(ang) * 220;
+      S.ships.push(sh);
+      S.events.push({ type: 'warpin', x: sh.x, y: sh.y, ang: ang + Math.PI, big: cls === 'cruiser' });
+    }
+    S.events.push({ type: 'banner', text: 'OVERTIME — WAVE ' + S.otWave,
+      sub: 'Reinforcements at +' + Math.round((boost - 1) * 100) + '% strength. Survive.' });
+    S.waveHullStart = S.player.hull;
+  }
+
   function tickWaves() {
-    if (hostiles().length === 0) {
-      if (S.wave >= WAVES.length) {
+    if (hostiles().length !== 0) return;
+    if (!S.overtime && S.wave >= WAVES.length) {
+      if (S.mode === 'play') {
         S.mode = 'victory'; S.stats.endT = S.t;
-        S.events.push({ type: 'banner', text: 'SITE SECURED', sub: null });
-        return;
+        S.score += 2000;
+        S.events.push({ type: 'banner', text: 'SITE SECURED', sub: '+2000 site bonus' });
       }
-      if (S.wave > 0 && S.clearedAnnounced < S.wave) {
-        S.clearedAnnounced = S.wave;
-        S.events.push({ type: 'banner', text: 'WAVE ' + S.wave + ' CLEARED',
-          sub: 'Cleared in ' + Math.round(S.t - S.waveStartT) + 's — next wave warping in' });
-      }
-      S.waveDelay -= TICK;
-      if (S.waveDelay <= 0) { spawnWave(S.wave); S.wave++; S.waveDelay = 2.8; }
+      return;
+    }
+    if (!S.overtime && S.wave > 0 && S.clearedAnnounced < S.wave) {
+      S.clearedAnnounced = S.wave;
+      let bonus = 500 * S.wave, sub = '+' + bonus + ' clear bonus';
+      if (S.player.hull >= S.waveHullStart) { bonus += 750; sub += ' · +750 untouched hull'; }
+      S.score += bonus;
+      S.events.push({ type: 'banner', text: 'WAVE ' + S.wave + ' CLEARED',
+        sub: sub + ' — next wave warping in' });
+    }
+    if (S.overtime && S.otCleared < S.otWave) {
+      S.otCleared = S.otWave;
+      const bonus = 400 + 300 * S.otWave;
+      S.score += bonus;
+      S.events.push({ type: 'banner', text: 'OVERTIME WAVE ' + S.otWave + ' CLEARED',
+        sub: '+' + bonus + ' — more incoming' });
+    }
+    S.waveDelay -= TICK;
+    if (S.waveDelay <= 0) {
+      if (S.overtime) spawnOvertimeWave();
+      else { spawnWave(S.wave); S.wave++; S.waveHullStart = S.player.hull; }
+      S.waveDelay = 2.8;
     }
   }
 
@@ -534,6 +613,9 @@ const Destiny = (() => {
       return;
     }
     if (cmd.restart) { reset(); S.mode = 'play'; S.waveDelay = 0.4; return; }
+    if (S.mode === 'victory' && cmd.overtime) {
+      S.mode = 'play'; S.overtime = true; S.waveDelay = 1.5;
+    }
     if (S.mode !== 'play' && S.mode !== 'dead') return;
     if (cmd.pause && S.mode === 'play') S.paused = !S.paused;
     if (S.paused && S.mode === 'play') return;
@@ -547,6 +629,7 @@ const Destiny = (() => {
     tickBeam();
     tickProjectiles();
     tickWrecks();
+    tickPickups();
     if (S.mode === 'play') tickWaves();
   }
 
@@ -1016,7 +1099,9 @@ const Trinity = (() => {
   /* ---------------- transient render state ---------------- */
   let particles = [], floaters = [], rings = [], flashes = [], pending = [];
   let screenFlash = 0;
-  let killFeed = [], banner = null, shake = 0, redFlash = 0, lockPulse = 0;
+  let killFeed = [], banner = null, shake = 0, redFlash = 0, lockPulse = 0, zoomPulse = 0;
+  let best = 0, newRecord = false;
+  try { best = parseInt(localStorage.getItem('cs_best') || '0', 10) || 0; } catch (e) {}
   const trails = new Map();
   const shieldFx = new Map();       // shipId -> {t}
   let lastFrame = performance.now() / 1000;
@@ -1112,9 +1197,22 @@ const Trinity = (() => {
           break;
         }
         case 'kill':
-          killFeed.unshift({ txt: e.name + ' destroyed', life: 5 });
+          killFeed.unshift({ txt: e.name + ' destroyed' + (e.combo > 1 ? '  ×' + e.combo : ''), life: 5 });
           if (killFeed.length > 5) killFeed.pop();
+          zoomPulse = Math.min(1, zoomPulse + 0.6);
           break;
+        case 'score':
+          floaters.push({ x: e.x, y: e.y, txt: '+' + e.pts + (e.combo > 1 ? '  ×' + e.combo : ''),
+            life: 1.3, col: '#ffd978', big: e.combo > 1 });
+          break;
+        case 'pickup': {
+          const label = e.ptype === 'cap' ? '+40 CAP' : e.ptype === 'armor' ? '+60 ARMOR' : 'WMG −15s';
+          floaters.push({ x: e.x, y: e.y, txt: label, life: 1.1,
+            col: e.ptype === 'cap' ? '#ffe9a8' : e.ptype === 'armor' ? '#ffc890' : '#a8e8ff' });
+          flashes.push({ x: e.x, y: e.y, r: 40, life: 0.25, max: 0.25,
+            img: e.ptype === 'wmg' ? GLOW.cyan : GLOW.gold });
+          break;
+        }
         case 'banner': banner = { text: e.text, sub: e.sub, life: 4.5 }; break;
         case 'lock': lockPulse = 1; break;
         case 'wmgfire':
@@ -1427,6 +1525,22 @@ const Trinity = (() => {
         glow(x2, y2, 16, GLOW.teal, 0.3);
       }
       g.lineWidth = 1;
+      g.globalCompositeOperation = 'source-over';
+    }
+
+    // salvage pickups: fly into the debris field to collect
+    if (S.pickups && S.pickups.length) {
+      g.globalCompositeOperation = 'lighter';
+      for (const pk of S.pickups) {
+        if (pk.life < 3 && Math.floor(now * 6) % 2 === 0) continue;   // expiring blink
+        const x = w2sx(pk.px + (pk.x - pk.px) * lerp), y = w2sy(pk.py + (pk.y - pk.py) * lerp);
+        const img = pk.type === 'cap' ? GLOW.gold : pk.type === 'armor' ? GLOW.orange : GLOW.cyan;
+        glow(x, y, 15 + 3 * Math.sin(now * 5 + pk.x), img, 0.7);
+        g.save(); g.translate(x, y); g.rotate(now * 2);
+        g.fillStyle = pk.type === 'cap' ? '#ffe9a8' : pk.type === 'armor' ? '#ffc890' : '#a8e8ff';
+        g.fillRect(-3.5, -3.5, 7, 7);
+        g.restore();
+      }
       g.globalCompositeOperation = 'source-over';
     }
 
@@ -1743,13 +1857,20 @@ const Trinity = (() => {
     }
 
     sctx.textAlign = 'left';
-    sctx.fillStyle = '#8fa4b8'; sctx.font = 'bold 12px Consolas,monospace';
-    sctx.fillText('WAVE ' + Math.min(S.wave, 3) + '/3', 16, 26);
-    sctx.fillStyle = '#7d93a8'; sctx.font = '11px Consolas,monospace';
-    sctx.fillText('KILLS ' + S.kills + '   ' + fmtTime(S.t), 16, 42);
-    sctx.fillStyle = 'rgba(110,130,150,0.75)'; sctx.font = '10px Consolas,monospace';
-    sctx.fillText('[WASD] thrust · [Shift] burn · [Tab/click] lock · [R] restart', 16, 58);
-    let ky = 78;
+    let ty2 = 26;
+    const hudLine = (txt, col, font) => {
+      sctx.fillStyle = col; sctx.font = font; sctx.fillText(txt, 16, ty2); ty2 += 16;
+    };
+    hudLine(S.overtime ? 'OVERTIME — WAVE ' + S.otWave : 'WAVE ' + Math.min(S.wave, 3) + '/3',
+      '#8fa4b8', 'bold 12px Consolas,monospace');
+    hudLine('SCORE ' + S.score.toLocaleString() + (best ? '   BEST ' + best.toLocaleString() : ''),
+      '#ffd978', 'bold 12px Consolas,monospace');
+    if (S.combo > 1 && S.comboT > 0)
+      hudLine('KILL CHAIN ×' + S.combo, '#ffb35a', 'bold 13px Consolas,monospace');
+    hudLine('KILLS ' + S.kills + '   ' + fmtTime(S.t), '#7d93a8', '11px Consolas,monospace');
+    hudLine('[WASD] thrust · [Shift] burn · [Tab] lock · [Space] WMG · [R] restart',
+      'rgba(110,130,150,0.75)', '10px Consolas,monospace');
+    let ky = ty2 + 4;
     for (const k of killFeed) {
       sctx.globalAlpha = clamp(k.life, 0, 1);
       sctx.fillStyle = '#e08a7a'; sctx.font = '11px Consolas,monospace';
@@ -1792,6 +1913,11 @@ const Trinity = (() => {
       const [bx, by] = put(pr.x, pr.y);
       sctx.fillStyle = '#ffb35a';
       sctx.fillRect(bx - 1.5, by - 1.5, 3, 3);
+    }
+    for (const pk of S.pickups || []) {
+      const [bx, by] = put(pk.x, pk.y);
+      sctx.fillStyle = '#b8ff9a';
+      sctx.fillRect(bx - 1, by - 1, 2, 2);
     }
     sctx.fillStyle = '#bfe0ff';
     sctx.beginPath(); sctx.arc(cx, cy, 3, 0, TAU); sctx.fill();
@@ -2045,7 +2171,11 @@ const Trinity = (() => {
       sctx.fillText('SHIP LOST', W / 2, H * 0.4);
       sctx.restore();
       sctx.fillStyle = '#c89898'; sctx.font = '13px Consolas,monospace';
-      sctx.fillText('Your pod drifts among the wreckage. ' + S.kills + ' kills in ' + fmtTime(S.stats.endT) + '.', W / 2, H * 0.4 + 30);
+      sctx.fillText('Your pod drifts among the wreckage. ' + S.kills + ' kills in ' + fmtTime(S.stats.endT)
+        + (S.overtime ? ' — overtime wave ' + S.otWave : '') + '.', W / 2, H * 0.4 + 30);
+      sctx.fillStyle = newRecord ? '#ffd978' : '#c8b898';
+      sctx.font = 'bold 15px Consolas,monospace';
+      sctx.fillText('SCORE ' + S.score.toLocaleString() + (newRecord ? '  — NEW RECORD' : '   ·   BEST ' + best.toLocaleString()), W / 2, H * 0.4 - 34);
       let tip = 'Tip: keep moving — fast sideways motion makes enemy turrets miss.';
       if (S.deathInfo) {
         if (S.deathInfo.src === 'torp') tip = 'Tip: torpedoes can be outrun — hold Shift and burn away from them.';
@@ -2071,10 +2201,14 @@ const Trinity = (() => {
       sctx.save();
       sctx.shadowColor = 'rgba(255,215,120,0.8)'; sctx.shadowBlur = 16;
       sctx.fillStyle = '#ffd978'; sctx.font = 'bold 18px Consolas,monospace';
-      sctx.fillText('RATING: ' + rating, W / 2, H * 0.4 + 60);
+      sctx.fillText('RATING: ' + rating + '   ·   SCORE ' + S.score.toLocaleString()
+        + (newRecord ? '  — NEW RECORD' : ''), W / 2, H * 0.4 + 60);
       sctx.restore();
-      sctx.fillStyle = '#eaf2fa'; sctx.font = 'bold 14px Consolas,monospace';
-      sctx.fillText('press R to fly it again', W / 2, H * 0.4 + 90);
+      sctx.fillStyle = '#a8e8c0'; sctx.font = 'bold 15px Consolas,monospace';
+      if (Math.floor(performance.now() / 500) % 2 === 0)
+        sctx.fillText('press N for OVERTIME — endless reinforcements, keep your score', W / 2, H * 0.4 + 92);
+      sctx.fillStyle = '#eaf2fa'; sctx.font = '13px Consolas,monospace';
+      sctx.fillText('or press R to fly the site again', W / 2, H * 0.4 + 116);
     }
   }
 
@@ -2092,9 +2226,18 @@ const Trinity = (() => {
     const lead = S.mode === 'play' || S.mode === 'dead' ? 0.55 : 0;
     cam.x += (ptx + p.vx * lead - cam.x) * (1 - Math.exp(-3.2 * dtF));
     cam.y += (pty + p.vy * lead - cam.y) * (1 - Math.exp(-3.2 * dtF));
-    const zoomT = S.abOn ? 0.86 : 1;
+    const zoomT = (S.abOn ? 0.86 : 1) * (1 + 0.05 * zoomPulse);
     zoomK += (zoomT - zoomK) * (1 - Math.exp(-2.5 * dtF));
+    zoomPulse *= Math.exp(-4 * dtF);
     scale = (H / 1350) * zoomK;
+
+    // persist the best score at the moment a run ends
+    if (S.mode === 'dead' || S.mode === 'victory') {
+      if (S.score > best) {
+        best = S.score; newRecord = true;
+        try { localStorage.setItem('cs_best', String(best)); } catch (e) {}
+      }
+    } else newRecord = false;
 
     if (shake > 0.3) {
       cam.x += (Math.random() - 0.5) * shake / scale * 0.35;
@@ -2152,7 +2295,9 @@ const Trinity = (() => {
     for (const f of floaters) {
       f.y -= 34 * dtF;
       sctx.globalAlpha = clamp(f.life * 2, 0, 1);
-      sctx.fillStyle = f.col; sctx.font = 'bold 12px Consolas,monospace'; sctx.textAlign = 'center';
+      sctx.fillStyle = f.col;
+      sctx.font = 'bold ' + (f.big ? 15 : 12) + 'px Consolas,monospace';
+      sctx.textAlign = 'center';
       sctx.fillText(f.txt, w2sx(f.x), w2sy(f.y));
     }
     sctx.globalAlpha = 1;
@@ -2315,7 +2460,8 @@ const Aura = (() => {
         case 'lock': blip(1150, 0.09, 'sine', 0.07); blip(1450, 0.12, 'sine', 0.06); break;
         case 'webbed': blip(220, 0.35, 'sawtooth', 0.05, 90); break;
         case 'warpin': noise(0.45, 0.18, 300, 4200); break;
-        case 'kill': blip(500, 0.15, 'triangle', 0.05, 700); break;
+        case 'kill': blip(440 + 60 * Math.min(e.combo || 1, 8), 0.15, 'triangle', 0.06, 900); break;
+        case 'pickup': blip(880, 0.08, 'sine', 0.06, 1320); blip(1320, 0.12, 'sine', 0.05); break;
         case 'banner': blip(340, 0.25, 'sine', 0.05, 420); break;
         case 'wmgstart':
           stopWmg();
@@ -2359,7 +2505,7 @@ const Aura = (() => {
    ===================================================================== */
 const Input = (() => {
   const held = new Set();
-  let tab = false, restart = false, anyKey = false, pause = false, click = null;
+  let tab = false, restart = false, anyKey = false, pause = false, overtimeKey = false, click = null;
   const ALIAS = { arrowup: 'w', arrowdown: 's', arrowleft: 'a', arrowright: 'd', z: 'w', q: 'a' };
 
   window.addEventListener('keydown', e => {
@@ -2373,6 +2519,7 @@ const Input = (() => {
     held.add(k);
     if (e.key === 'Tab') tab = true;
     if (k === 'r') restart = true;
+    if (k === 'n') overtimeKey = true;
   });
   window.addEventListener('keyup', e => {
     let k = e.key.toLowerCase();
@@ -2399,6 +2546,7 @@ const Input = (() => {
       ab: held.has('shift'),
       wmg: held.has(' '),
       tab, restart, anyKey, pause,
+      overtime: overtimeKey,
       clickWorld: null, lockId: null
     };
     if (click) {
@@ -2406,7 +2554,7 @@ const Input = (() => {
       if (id != null) cmd.lockId = id;
       else cmd.clickWorld = Trinity.screenToWorld(click.x, click.y);
     }
-    tab = false; restart = false; anyKey = false; pause = false; click = null;
+    tab = false; restart = false; anyKey = false; pause = false; overtimeKey = false; click = null;
     return cmd;
   }
   return { consume };
