@@ -22,6 +22,9 @@ Or play it live: **https://marcoakes.github.io/carbon-skirmish/**
 
 ## How to play
 
+The title screen shows every control, and your first flight walks you through them
+step by step. **P** pauses and brings the control reference back at any time.
+
 - **WASD** — thrust. Your ship keeps inertia; feather it.
 - **Shift** — afterburner (drains capacitor).
 - **Tab / click a hostile** — begin target lock. Once locked, turrets fire automatically
