@@ -59,7 +59,8 @@ const Destiny = (() => {
                cap: 130, cregen: 8.5, abDrain: 15,
                gunDmg: 12, gunRof: 0.4, gunRange: 520, gunCost: 3,
                pspeed: 1200, track: 1.6,
-               wmgDmg: 1300, wmgRange: 2600, wmgWidth: 80, wmgCharge: 2.6, wmgCd: 45, wmgDur: 0.75 },
+               wmgDmg: 1300, wmgRange: 2600, wmgWidth: 80, wmgCharge: 2.6, wmgCd: 45, wmgDur: 0.75,
+               mslDmg: 90, mslSpeed: 480, mslTurn: 2.5, mslCd: 1.2, mslLife: 9 },
     scout:   { radius: 9, speed: 265, orbit: 310, inertia: 3.2,
                shield: 35, sregen: 1.5, armor: 30, hull: 30,
                gunDmg: 5, gunRof: 1.1, gunRange: 470, pspeed: 900, track: 2.6,
@@ -108,6 +109,8 @@ const Destiny = (() => {
       hull: d.hull, hullMax: d.hull,
       cap: d.cap || 0, capMax: d.cap || 0,
       gunCd: rr(0.4, (d.gunRof || 1) + 0.4), torpCd: 3,
+      msl: cls === 'player' ? 6 : 0, mslCd: 0,
+      bossPhase: 0, lance: null, lanceCd: 0, lanceTick: 0,
       orbitDir: rng() < 0.5 ? 1 : -1, muzzle: 1,
       alive: true, wreck: false, wreckT: 0, spin: 0
     };
@@ -181,7 +184,7 @@ const Destiny = (() => {
         if (rng() < 0.55) {
           const roll = rng();
           S.pickups.push({
-            type: roll < 0.4 ? 'cap' : roll < 0.8 ? 'armor' : 'wmg',
+            type: roll < 0.3 ? 'cap' : roll < 0.62 ? 'armor' : roll < 0.84 ? 'ammo' : 'wmg',
             x: sh.x, y: sh.y, px: sh.x, py: sh.y,
             vx: sh.vx * 0.3 + rr(-15, 15), vy: sh.vy * 0.3 + rr(-15, 15),
             life: 12
@@ -250,8 +253,8 @@ const Destiny = (() => {
     return roll.hit;
   }
 
-  function launchTorp(sh, d) {
-    const ang = Math.atan2(S.player.y - sh.y, S.player.x - sh.x);
+  function launchTorp(sh, d, angOff) {
+    const ang = Math.atan2(S.player.y - sh.y, S.player.x - sh.x) + (angOff || 0);
     S.projectiles.push({
       kind: 'torp',
       x: sh.x, y: sh.y, px: sh.x, py: sh.y,
@@ -412,6 +415,24 @@ const Destiny = (() => {
       }
     }
 
+    // missiles: fire-and-forget at the locked target
+    p.mslCd -= TICK;
+    if (cmd.missile && p.mslCd <= 0 && p.msl > 0 && S.locked && tgt) {
+      p.msl--;
+      p.mslCd = d.mslCd;
+      const ang = p.face;
+      const mx = p.x + Math.cos(ang) * p.radius * 1.5;
+      const my = p.y + Math.sin(ang) * p.radius * 1.5;
+      S.projectiles.push({
+        kind: 'missile', x: mx, y: my, px: mx, py: my,
+        vx: Math.cos(ang) * d.mslSpeed * 0.6 + p.vx * 0.4,
+        vy: Math.sin(ang) * d.mslSpeed * 0.6 + p.vy * 0.4,
+        speed: d.mslSpeed, turn: d.mslTurn, dmg: d.mslDmg,
+        faction: 'player', hostileShot: false, life: d.mslLife, targetId: tgt.id
+      });
+      S.events.push({ type: 'mlaunch', x: mx, y: my });
+    }
+
     p.shield = Math.min(p.shieldMax, p.shield + d.sregen * TICK);
     p.cap = Math.min(p.capMax, p.cap + d.cregen * TICK);
     if (S.capEmptyFlash > 0) S.capEmptyFlash -= TICK;
@@ -425,19 +446,70 @@ const Destiny = (() => {
       const rx = p.x - sh.x, ry = p.y - sh.y;
       const dist = Math.hypot(rx, ry) || 1;
       const nx = rx / dist, ny = ry / dist;
-      const tx = -ny * sh.orbitDir, ty = nx * sh.orbitDir;
-      let dx, dy;
-      if (dist > d.orbit * 1.25)     { dx = nx * 0.9 + tx * 0.3;  dy = ny * 0.9 + ty * 0.3; }
-      else if (dist < d.orbit * 0.75){ dx = -nx * 0.6 + tx * 0.8; dy = -ny * 0.6 + ty * 0.8; }
-      else                           { dx = tx + nx * 0.05;       dy = ty + ny * 0.05; }
-      if (d.jink) {
-        const j = Math.sin(S.t * 2.6 + sh.id * 2.1) * d.jink;
-        const c = Math.cos(j), s2 = Math.sin(j);
-        const ndx = dx * c - dy * s2, ndy = dx * s2 + dy * c;
-        dx = ndx; dy = ndy;
+
+      // ---- boss phases: the Sanguine Vesper escalates as she burns ----
+      let lanceBusy = false;
+      if (sh.cls === 'cruiser') {
+        if (sh.bossPhase === 0) sh.bossPhase = 1;
+        if (sh.bossPhase < 2 && sh.shield <= 1 && sh.armor < sh.armorMax * 0.5) {
+          sh.bossPhase = 2;
+          S.events.push({ type: 'banner', text: 'THE VESPER OPENS HER TUBES',
+            sub: 'Torpedo salvos — keep the afterburner warm' });
+        }
+        if (sh.bossPhase < 3 && sh.hull < sh.hullMax * 0.6) {
+          sh.bossPhase = 3; sh.lanceCd = 3;
+          S.events.push({ type: 'banner', text: 'SPINAL LANCE POWERING UP',
+            sub: 'When she locks her firing line — BREAK OFF IT' });
+        }
+        if (sh.bossPhase >= 3) {
+          if (!sh.lance) sh.lance = { mode: 'idle', t: 0, ang: 0 };
+          const L = sh.lance;
+          if (L.mode === 'idle') {
+            sh.lanceCd -= TICK;
+            if (sh.lanceCd <= 0 && dist < 1400) {
+              L.mode = 'charge'; L.t = 3;
+              L.ang = Math.atan2(ry, rx);   // locked NOW — dodge by leaving the line
+              S.events.push({ type: 'bosslance', phase: 'charge', x: sh.x, y: sh.y });
+            }
+          } else if (L.mode === 'charge') {
+            L.t -= TICK;
+            if (L.t <= 0) {
+              L.mode = 'fire'; L.t = 1.2; sh.lanceTick = 0;
+              S.events.push({ type: 'bosslance', phase: 'fire', x: sh.x, y: sh.y });
+            }
+          } else if (L.mode === 'fire') {
+            L.t -= TICK;
+            sh.lanceTick++;
+            if (sh.lanceTick % 6 === 0) {
+              const ldx = Math.cos(L.ang), ldy = Math.sin(L.ang);
+              const prx = p.x - sh.x, pry = p.y - sh.y;
+              const along = prx * ldx + pry * ldy;
+              const perp = Math.abs(prx * ldy - pry * ldx);
+              if (along > 0 && along < 1800 && perp < 45 + p.radius) applyDamage(p, 45, 'cruiser');
+            }
+            if (L.t <= 0) { L.mode = 'idle'; sh.lanceCd = 12; }
+          }
+          lanceBusy = L.mode !== 'idle';
+        }
       }
-      const l = Math.hypot(dx, dy) || 1;
-      steer(sh, dx / l, dy / l, d.speed, d.inertia);
+
+      if (lanceBusy) {
+        steer(sh, 0, 0, 0, d.inertia * 2);   // holds position, bow on the line
+      } else {
+        const tx = -ny * sh.orbitDir, ty = nx * sh.orbitDir;
+        let dx, dy;
+        if (dist > d.orbit * 1.25)     { dx = nx * 0.9 + tx * 0.3;  dy = ny * 0.9 + ty * 0.3; }
+        else if (dist < d.orbit * 0.75){ dx = -nx * 0.6 + tx * 0.8; dy = -ny * 0.6 + ty * 0.8; }
+        else                           { dx = tx + nx * 0.05;       dy = ty + ny * 0.05; }
+        if (d.jink) {
+          const j = Math.sin(S.t * 2.6 + sh.id * 2.1) * d.jink;
+          const c = Math.cos(j), s2 = Math.sin(j);
+          const ndx = dx * c - dy * s2, ndy = dx * s2 + dy * c;
+          dx = ndx; dy = ndy;
+        }
+        const l = Math.hypot(dx, dy) || 1;
+        steer(sh, dx / l, dy / l, d.speed, d.inertia);
+      }
 
       sh.gunCd -= TICK;
       if (sh.gunCd <= 0 && dist <= d.gunRange) {
@@ -446,10 +518,16 @@ const Destiny = (() => {
       }
       if (d.torpRof) {
         sh.torpCd -= TICK;
-        if (sh.torpCd <= 0 && dist < 1500) { launchTorp(sh, d); sh.torpCd = d.torpRof; }
+        if (sh.torpCd <= 0 && dist < 1500) {
+          const salvo = sh.bossPhase >= 2 ? 4 : 1;
+          for (let i = 0; i < salvo; i++)
+            launchTorp(sh, d, salvo > 1 ? (i - (salvo - 1) / 2) * 0.22 : 0);
+          sh.torpCd = sh.bossPhase >= 2 ? 9 : d.torpRof;
+        }
       }
     }
-    if (Math.hypot(sh.vx, sh.vy) > 5) sh.face = Math.atan2(sh.vy, sh.vx);
+    if (sh.lance && sh.lance.mode !== 'idle') sh.face = sh.lance.ang;
+    else if (Math.hypot(sh.vx, sh.vy) > 5) sh.face = Math.atan2(sh.vy, sh.vx);
     sh.shield = Math.min(sh.shieldMax, sh.shield + d.sregen * TICK);
   }
 
@@ -478,6 +556,27 @@ const Destiny = (() => {
           pr.dead = true;
           S.events.push({ type: 'torpboom', x: pr.x, y: pr.y, fizzle: true });
         }
+        continue;
+      }
+
+      if (pr.kind === 'missile') {
+        const t = S.ships.find(s => s.id === pr.targetId && s.alive);
+        if (t) {
+          const want = Math.atan2(t.y - pr.y, t.x - pr.x);
+          let cur = Math.atan2(pr.vy, pr.vx);
+          let diff = want - cur;
+          while (diff > Math.PI) diff -= TAU;
+          while (diff < -Math.PI) diff += TAU;
+          cur += clamp(diff, -pr.turn * TICK, pr.turn * TICK);
+          pr.vx = Math.cos(cur) * pr.speed; pr.vy = Math.sin(cur) * pr.speed;
+        }
+        pr.x += pr.vx * TICK; pr.y += pr.vy * TICK;
+        pr.life -= TICK;
+        if (t && Math.hypot(t.x - pr.x, t.y - pr.y) <= t.radius + 8) {
+          pr.dead = true;
+          S.events.push({ type: 'boom', x: pr.x, y: pr.y, r: 6 });
+          applyDamage(t, pr.dmg, 'missile');
+        } else if (pr.life <= 0) pr.dead = true;
         continue;
       }
 
@@ -542,6 +641,7 @@ const Destiny = (() => {
         pk.dead = true;
         if (pk.type === 'cap') p.cap = Math.min(p.capMax, p.cap + 40);
         else if (pk.type === 'armor') p.armor = Math.min(p.armorMax, p.armor + 60);
+        else if (pk.type === 'ammo') p.msl = Math.min(8, p.msl + 2);
         else S.wmg.cd = Math.max(0, S.wmg.cd - 15);
         S.events.push({ type: 'pickup', x: pk.x, y: pk.y, ptype: pk.type });
       }
@@ -1206,13 +1306,18 @@ const Trinity = (() => {
             life: 1.3, col: '#ffd978', big: e.combo > 1 });
           break;
         case 'pickup': {
-          const label = e.ptype === 'cap' ? '+40 CAP' : e.ptype === 'armor' ? '+60 ARMOR' : 'WMG −15s';
+          const label = e.ptype === 'cap' ? '+40 CAP' : e.ptype === 'armor' ? '+60 ARMOR'
+            : e.ptype === 'ammo' ? '+2 MISSILES' : 'WMG −15s';
           floaters.push({ x: e.x, y: e.y, txt: label, life: 1.1,
-            col: e.ptype === 'cap' ? '#ffe9a8' : e.ptype === 'armor' ? '#ffc890' : '#a8e8ff' });
+            col: e.ptype === 'cap' ? '#ffe9a8' : e.ptype === 'armor' ? '#ffc890'
+              : e.ptype === 'ammo' ? '#b8ffe0' : '#a8e8ff' });
           flashes.push({ x: e.x, y: e.y, r: 40, life: 0.25, max: 0.25,
-            img: e.ptype === 'wmg' ? GLOW.cyan : GLOW.gold });
+            img: e.ptype === 'wmg' ? GLOW.cyan : e.ptype === 'ammo' ? GLOW.teal : GLOW.gold });
           break;
         }
+        case 'mlaunch':
+          flashes.push({ x: e.x, y: e.y, r: 26, life: 0.12, max: 0.12, img: GLOW.teal });
+          break;
         case 'banner': banner = { text: e.text, sub: e.sub, life: 4.5 }; break;
         case 'lock': lockPulse = 1; break;
         case 'wmgfire':
@@ -1528,16 +1633,51 @@ const Trinity = (() => {
       g.globalCompositeOperation = 'source-over';
     }
 
+    // boss spinal lance: telegraph line during charge, red beam on fire
+    for (const sh of S.ships) {
+      if (sh.cls !== 'cruiser' || !sh.alive || !sh.lance || sh.lance.mode === 'idle') continue;
+      const L = sh.lance;
+      const x1 = w2sx(sh.px + (sh.x - sh.px) * lerp), y1 = w2sy(sh.py + (sh.y - sh.py) * lerp);
+      const dxl = Math.cos(L.ang), dyl = Math.sin(L.ang);
+      const x2 = x1 + dxl * 1800 * scale, y2 = y1 + dyl * 1800 * scale;
+      g.globalCompositeOperation = 'lighter';
+      if (L.mode === 'charge') {
+        const kk = 1 - L.t / 3;
+        g.strokeStyle = 'rgba(255,70,60,' + (0.15 + 0.45 * kk).toFixed(2) + ')';
+        g.setLineDash([8, 10]);
+        g.lineDashOffset = -performance.now() / 16;
+        g.lineWidth = 2 + 3 * kk;
+        g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+        g.setLineDash([]);
+        glow(x1 + dxl * 40 * scale, y1 + dyl * 40 * scale,
+          (12 + 46 * kk) * (1 + 0.2 * Math.sin(now * 30)), GLOW.crimson, 0.4 + 0.6 * kk);
+      } else {
+        const env = Math.min(1, L.t * 4);
+        for (const [w2, col] of [[100, 'rgba(255,60,50,' + (0.25 * env).toFixed(2) + ')'],
+                                 [44, 'rgba(255,120,90,' + (0.55 * env).toFixed(2) + ')'],
+                                 [15, 'rgba(255,235,220,' + (0.9 * env).toFixed(2) + ')']]) {
+          g.strokeStyle = col; g.lineWidth = Math.max(1, w2 * scale);
+          g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+        }
+        glow(x1, y1, 130 * scale * env + 20, GLOW.crimson, env);
+        shake = Math.min(30, shake + 22 * dtF);
+      }
+      g.lineWidth = 1;
+      g.globalCompositeOperation = 'source-over';
+    }
+
     // salvage pickups: fly into the debris field to collect
     if (S.pickups && S.pickups.length) {
       g.globalCompositeOperation = 'lighter';
       for (const pk of S.pickups) {
         if (pk.life < 3 && Math.floor(now * 6) % 2 === 0) continue;   // expiring blink
         const x = w2sx(pk.px + (pk.x - pk.px) * lerp), y = w2sy(pk.py + (pk.y - pk.py) * lerp);
-        const img = pk.type === 'cap' ? GLOW.gold : pk.type === 'armor' ? GLOW.orange : GLOW.cyan;
+        const img = pk.type === 'cap' ? GLOW.gold : pk.type === 'armor' ? GLOW.orange
+          : pk.type === 'ammo' ? GLOW.teal : GLOW.cyan;
         glow(x, y, 15 + 3 * Math.sin(now * 5 + pk.x), img, 0.7);
         g.save(); g.translate(x, y); g.rotate(now * 2);
-        g.fillStyle = pk.type === 'cap' ? '#ffe9a8' : pk.type === 'armor' ? '#ffc890' : '#a8e8ff';
+        g.fillStyle = pk.type === 'cap' ? '#ffe9a8' : pk.type === 'armor' ? '#ffc890'
+          : pk.type === 'ammo' ? '#b8ffe0' : '#a8e8ff';
         g.fillRect(-3.5, -3.5, 7, 7);
         g.restore();
       }
@@ -1556,6 +1696,13 @@ const Trinity = (() => {
         if (Math.random() < 0.7)
           particles.push({ x: pr.x, y: pr.y, vx: (Math.random() - 0.5) * 25, vy: (Math.random() - 0.5) * 25,
             life: 0.55, max: 0.55, kind: 'smoke', sz: 3.5 });
+      } else if (pr.kind === 'missile') {
+        glow(x, y, 11, GLOW.teal, 0.85);
+        g.fillStyle = '#d8fff0';
+        g.beginPath(); g.arc(x, y, 2, 0, TAU); g.fill();
+        if (Math.random() < 0.55)
+          particles.push({ x: pr.x, y: pr.y, vx: (Math.random() - 0.5) * 20, vy: (Math.random() - 0.5) * 20,
+            life: 0.4, max: 0.4, kind: 'smoke', sz: 2.5 });
       } else {
         const l = 0.018;
         // outer colour glow + hot core line
@@ -1758,6 +1905,8 @@ const Trinity = (() => {
     if (S.capEmptyFlash > 0) warn('CAPACITOR EMPTY', '#ff8c5a');
     if (S.webbedBy.length) warn('WEBBED — SPEED REDUCED', '#5affc8');
     if (S.projectiles.some(pr => pr.kind === 'torp')) warn('TORPEDO INBOUND', '#ffb35a');
+    if (S.ships.some(s => s.alive && s.cls === 'cruiser' && s.lance && s.lance.mode === 'charge'))
+      warn('SPINAL LANCE — BREAK OFF HER LINE', '#ff6a5a');
     if (S.abOn) {
       sctx.fillStyle = '#9fe0ff'; sctx.font = 'bold 10px Consolas,monospace'; sctx.textAlign = 'center';
       sctx.fillText('AFTERBURNER', cx, cy + 62);
@@ -1768,6 +1917,13 @@ const Trinity = (() => {
     const wm = S.wmg;
     if (!wm) return;
     const x = 16, y = H - 84, w = 216, h = 64;
+    // missile rack
+    sctx.fillStyle = '#9fc0dd'; sctx.font = 'bold 11px Consolas,monospace'; sctx.textAlign = 'left';
+    sctx.fillText('MISSILES [F]', x + 12, y - 12);
+    for (let i = 0; i < 8; i++) {
+      sctx.fillStyle = i < S.player.msl ? '#a8ffd8' : 'rgba(60,70,80,0.6)';
+      sctx.fillRect(x + 108 + i * 13, y - 21, 9, 11);
+    }
     sctx.fillStyle = 'rgba(7,12,20,0.75)';
     roundRectPath(sctx, x, y, w, h, 8); sctx.fill();
     sctx.strokeStyle = wm.charging ? 'rgba(140,220,255,0.9)' : 'rgba(110,140,170,0.4)';
@@ -1868,7 +2024,7 @@ const Trinity = (() => {
     if (S.combo > 1 && S.comboT > 0)
       hudLine('KILL CHAIN ×' + S.combo, '#ffb35a', 'bold 13px Consolas,monospace');
     hudLine('KILLS ' + S.kills + '   ' + fmtTime(S.t), '#7d93a8', '11px Consolas,monospace');
-    hudLine('[WASD] thrust · [Shift] burn · [Tab] lock · [Space] WMG · [R] restart',
+    hudLine('[WASD] thrust · [Shift] burn · [Tab] lock · [F] missile · [Space] WMG',
       'rgba(110,130,150,0.75)', '10px Consolas,monospace');
     let ky = ty2 + 4;
     for (const k of killFeed) {
@@ -2030,7 +2186,7 @@ const Trinity = (() => {
   }
 
   function drawControlCards(topY) {
-    const cw = 340, ch = 268, gap = 24;
+    const cw = 340, ch = 296, gap = 24;
     const twoCol = W > cw * 2 + gap + 40;
     const x1 = twoCol ? W / 2 - cw - gap / 2 : W / 2 - cw / 2;
     const x2 = twoCol ? W / 2 + gap / 2 : x1;
@@ -2060,7 +2216,8 @@ const Trinity = (() => {
     row(topY + 128, 'Tab', 'Lock next hostile');
     row(topY + 156, 'Click', 'Lock the ship you click');
     row(topY + 184, 'Space', 'Wave Motion Gun (hold)');
-    row(topY + 212, 'P', 'Pause   ·   R restarts');
+    row(topY + 212, 'F', 'Fire missile at locked target');
+    row(topY + 240, 'P', 'Pause   ·   R restarts');
 
     card(x2, y2, 'HOW TO WIN');
     const lines = [
@@ -2390,11 +2547,8 @@ const Trinity = (() => {
    ===================================================================== */
 const Aura = (() => {
   let ac = null, master = null, noiseBuf = null, abGain = null;
-  let wmgOsc = null, wmgOscGain = null;
-
-  function stopWmg() {
-    if (wmgOsc) { try { wmgOsc.stop(); } catch (err) {} wmgOsc = null; wmgOscGain = null; }
-  }
+  let droneGain = null, engGain = null, engFilter = null;
+  let wmgOsc = null, wmgOscGain = null, wmgSwellGain = null, wmgSwellFilter = null;
 
   function ensure() {
     if (!ac) {
@@ -2405,12 +2559,13 @@ const Aura = (() => {
         noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
         const d = noiseBuf.getChannelData(0);
         for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
-        // ambient drone
-        const o1 = ac.createOscillator(), o2 = ac.createOscillator(), g = ac.createGain();
+        // ambient drone — swells as the war heats up
+        const o1 = ac.createOscillator(), o2 = ac.createOscillator();
+        droneGain = ac.createGain();
         o1.frequency.value = 55; o2.frequency.value = 55.7;
         o1.type = 'sine'; o2.type = 'sine';
-        g.gain.value = 0.02;
-        o1.connect(g); o2.connect(g); g.connect(master);
+        droneGain.gain.value = 0.015;
+        o1.connect(droneGain); o2.connect(droneGain); droneGain.connect(master);
         o1.start(); o2.start();
         // afterburner noise loop
         const src = ac.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
@@ -2418,23 +2573,47 @@ const Aura = (() => {
         abGain = ac.createGain(); abGain.gain.value = 0;
         src.connect(bp); bp.connect(abGain); abGain.connect(master);
         src.start();
+        // engine hum — follows the throttle
+        const esrc = ac.createBufferSource(); esrc.buffer = noiseBuf; esrc.loop = true;
+        engFilter = ac.createBiquadFilter(); engFilter.type = 'lowpass'; engFilter.frequency.value = 160;
+        engGain = ac.createGain(); engGain.gain.value = 0;
+        esrc.connect(engFilter); engFilter.connect(engGain); engGain.connect(master);
+        esrc.start();
+        // wave motion gun charge layers (persistent, gain-managed)
+        wmgOsc = ac.createOscillator(); wmgOscGain = ac.createGain();
+        wmgOsc.type = 'sawtooth'; wmgOsc.frequency.value = 55; wmgOscGain.gain.value = 0;
+        wmgOsc.connect(wmgOscGain); wmgOscGain.connect(master); wmgOsc.start();
+        const ssrc = ac.createBufferSource(); ssrc.buffer = noiseBuf; ssrc.loop = true;
+        wmgSwellFilter = ac.createBiquadFilter(); wmgSwellFilter.type = 'bandpass'; wmgSwellFilter.Q.value = 1.2;
+        wmgSwellGain = ac.createGain(); wmgSwellGain.gain.value = 0;
+        ssrc.connect(wmgSwellFilter); wmgSwellFilter.connect(wmgSwellGain); wmgSwellGain.connect(master);
+        ssrc.start();
       } catch (e) {}
     }
     if (ac && ac.state === 'suspended') ac.resume();
   }
 
-  function blip(freq, dur, type, vol, slide) {
+  // route a one-shot through a stereo panner so battle reads left/right
+  function out(pan) {
+    if (!pan || !ac.createStereoPanner) return master;
+    const sp = ac.createStereoPanner();
+    sp.pan.value = clamp(pan, -1, 1);
+    sp.connect(master);
+    return sp;
+  }
+
+  function blip(freq, dur, type, vol, slide, pan) {
     if (!ac) return;
     const o = ac.createOscillator(), g = ac.createGain();
     o.type = type; o.frequency.value = freq;
     if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, slide), ac.currentTime + dur);
     g.gain.setValueAtTime(vol, ac.currentTime);
     g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
-    o.connect(g); g.connect(master);
+    o.connect(g); g.connect(out(pan));
     o.start(); o.stop(ac.currentTime + dur);
   }
 
-  function noise(dur, vol, freq, slide) {
+  function noise(dur, vol, freq, slide, pan) {
     if (!ac) return;
     const src = ac.createBufferSource(); src.buffer = noiseBuf;
     const f = ac.createBiquadFilter(); f.type = 'lowpass';
@@ -2443,41 +2622,37 @@ const Aura = (() => {
     const g = ac.createGain();
     g.gain.setValueAtTime(vol, ac.currentTime);
     g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
-    src.connect(f); f.connect(g); g.connect(master);
+    src.connect(f); f.connect(g); g.connect(out(pan));
     src.start(); src.stop(ac.currentTime + dur);
   }
 
-  function handle(evts) {
+  function handle(evts, S) {
     if (!ac) return;
+    const px = S && S.player ? S.player.x : 0;
     for (const e of evts) {
+      const pan = e.x != null ? clamp((e.x - px) / 900, -0.85, 0.85) : 0;
       switch (e.type) {
-        case 'muzzle': if (e.player) { blip(600, 0.08, 'square', 0.045, 200); noise(0.05, 0.03, 3500, 800); } break;
-        case 'hit': e.layer === 'shield' ? blip(950, 0.07, 'triangle', 0.04, 500) : noise(0.12, 0.06, 900, 200); break;
-        case 'boom': noise(e.big ? 1.4 : 0.6, e.big ? 0.5 : 0.3, 900, 50); blip(70, e.big ? 1 : 0.5, 'sine', 0.2, 28); break;
-        case 'torpboom': if (!e.fizzle) { noise(0.8, 0.4, 700, 40); blip(60, 0.7, 'sine', 0.25, 25); } break;
-        case 'torplaunch': noise(0.4, 0.1, 500, 1800); break;
+        case 'muzzle': if (e.player) { blip(600, 0.08, 'square', 0.045, 200, pan); noise(0.05, 0.03, 3500, 800, pan); } break;
+        case 'hit': e.layer === 'shield' ? blip(950, 0.07, 'triangle', 0.04, 500, pan) : noise(0.12, 0.06, 900, 200, pan); break;
+        case 'boom': noise(e.big ? 1.4 : 0.6, e.big ? 0.5 : 0.3, 900, 50, pan); blip(70, e.big ? 1 : 0.5, 'sine', 0.2, 28, pan); break;
+        case 'torpboom': if (!e.fizzle) { noise(0.8, 0.4, 700, 40, pan); blip(60, 0.7, 'sine', 0.25, 25, pan); } break;
+        case 'torplaunch': noise(0.4, 0.1, 500, 1800, pan); break;
         case 'torpwarn': blip(880, 0.1, 'sine', 0.05); break;
         case 'lock': blip(1150, 0.09, 'sine', 0.07); blip(1450, 0.12, 'sine', 0.06); break;
         case 'webbed': blip(220, 0.35, 'sawtooth', 0.05, 90); break;
-        case 'warpin': noise(0.45, 0.18, 300, 4200); break;
-        case 'kill': blip(440 + 60 * Math.min(e.combo || 1, 8), 0.15, 'triangle', 0.06, 900); break;
-        case 'pickup': blip(880, 0.08, 'sine', 0.06, 1320); blip(1320, 0.12, 'sine', 0.05); break;
+        case 'warpin': noise(0.45, 0.18, 300, 4200, pan); break;
+        case 'kill': blip(440 + 60 * Math.min(e.combo || 1, 8), 0.15, 'triangle', 0.06, 900, pan); break;
+        case 'pickup': blip(880, 0.08, 'sine', 0.06, 1320, pan); blip(1320, 0.12, 'sine', 0.05, 0, pan); break;
         case 'banner': blip(340, 0.25, 'sine', 0.05, 420); break;
-        case 'wmgstart':
-          stopWmg();
-          try {
-            wmgOsc = ac.createOscillator(); wmgOscGain = ac.createGain();
-            wmgOsc.type = 'sawtooth'; wmgOsc.frequency.value = 55;
-            wmgOscGain.gain.value = 0.02;
-            wmgOsc.connect(wmgOscGain); wmgOscGain.connect(master);
-            wmgOsc.start();
-          } catch (err) { wmgOsc = null; wmgOscGain = null; }
+        case 'mlaunch': noise(0.5, 0.14, 500, 2800, pan); blip(320, 0.3, 'triangle', 0.05, 900, pan); break;
+        case 'bosslance':
+          if (e.phase === 'charge') blip(90, 3, 'sawtooth', 0.08, 750, pan);
+          else { noise(1.4, 0.4, 1000, 60, pan); blip(58, 1.2, 'sine', 0.3, 28, pan); }
           break;
-        case 'wmgcancel': stopWmg(); break;
+        case 'wmgcancel': blip(240, 0.35, 'sawtooth', 0.05, 55); break;
         case 'wmgfire':
-          stopWmg();
           noise(2.4, 0.55, 1400, 35);
-          blip(44, 2.4, 'sine', 0.4, 18);
+          blip(30, 2.8, 'sine', 0.45, 16);
           blip(220, 1.2, 'sawtooth', 0.12, 30);
           break;
       }
@@ -2486,14 +2661,28 @@ const Aura = (() => {
 
   function update(S) {
     if (!ac || !abGain) return;
-    const target = S.abOn ? 0.06 : 0;
-    abGain.gain.setTargetAtTime(target, ac.currentTime, 0.08);
-    if (wmgOsc && S.wmg) {
-      if (!S.wmg.charging) stopWmg();
-      else {
-        wmgOsc.frequency.setTargetAtTime(55 + 1100 * S.wmg.charge * S.wmg.charge, ac.currentTime, 0.05);
-        wmgOscGain.gain.setTargetAtTime(0.02 + 0.07 * S.wmg.charge, ac.currentTime, 0.05);
-      }
+    const t = ac.currentTime;
+    abGain.gain.setTargetAtTime(S.abOn ? 0.06 : 0, t, 0.08);
+    const p = S.player;
+    const spd = p ? Math.hypot(p.vx, p.vy) : 0;
+    if (engGain) {
+      engGain.gain.setTargetAtTime(
+        p && p.alive && S.mode === 'play' && !S.paused ? 0.012 + (spd / 430) * 0.035 : 0, t, 0.15);
+      engFilter.frequency.setTargetAtTime(160 + spd * 1.1, t, 0.15);
+    }
+    if (droneGain) {
+      const hot = S.ships && S.ships.some(s => s.alive && s.faction === 'hostile');
+      droneGain.gain.setTargetAtTime(
+        0.012 + 0.004 * Math.min((S.wave || 0) + (S.otWave || 0), 8) + (hot ? 0.006 : 0), t, 0.5);
+    }
+    const ch = S.wmg && S.wmg.charging ? S.wmg.charge : 0;
+    if (wmgOscGain) {
+      wmgOscGain.gain.setTargetAtTime(ch > 0 ? 0.02 + 0.07 * ch : 0, t, 0.05);
+      wmgOsc.frequency.setTargetAtTime(55 + 1100 * ch * ch, t, 0.05);
+    }
+    if (wmgSwellGain) {
+      wmgSwellGain.gain.setTargetAtTime(ch > 0 ? 0.02 + 0.13 * ch * ch : 0, t, 0.08);
+      wmgSwellFilter.frequency.setTargetAtTime(300 + 2600 * ch, t, 0.08);
     }
   }
 
@@ -2505,7 +2694,7 @@ const Aura = (() => {
    ===================================================================== */
 const Input = (() => {
   const held = new Set();
-  let tab = false, restart = false, anyKey = false, pause = false, overtimeKey = false, click = null;
+  let tab = false, restart = false, anyKey = false, pause = false, overtimeKey = false, missileKey = false, click = null;
   const ALIAS = { arrowup: 'w', arrowdown: 's', arrowleft: 'a', arrowright: 'd', z: 'w', q: 'a' };
 
   window.addEventListener('keydown', e => {
@@ -2520,6 +2709,7 @@ const Input = (() => {
     if (e.key === 'Tab') tab = true;
     if (k === 'r') restart = true;
     if (k === 'n') overtimeKey = true;
+    if (k === 'f') missileKey = true;
   });
   window.addEventListener('keyup', e => {
     let k = e.key.toLowerCase();
@@ -2547,6 +2737,7 @@ const Input = (() => {
       wmg: held.has(' '),
       tab, restart, anyKey, pause,
       overtime: overtimeKey,
+      missile: missileKey,
       clickWorld: null, lockId: null
     };
     if (click) {
@@ -2554,7 +2745,7 @@ const Input = (() => {
       if (id != null) cmd.lockId = id;
       else cmd.clickWorld = Trinity.screenToWorld(click.x, click.y);
     }
-    tab = false; restart = false; anyKey = false; pause = false; overtimeKey = false; click = null;
+    tab = false; restart = false; anyKey = false; pause = false; overtimeKey = false; missileKey = false; click = null;
     return cmd;
   }
   return { consume };
@@ -2572,7 +2763,7 @@ const Input = (() => {
       evts.push(...Destiny.drainEvents());
       acc -= TICK;
     }
-    Aura.handle(evts);
+    Aura.handle(evts, Destiny.state());
     Aura.update(Destiny.state());
     Trinity.render(acc / TICK, evts);
     requestAnimationFrame(frame);
