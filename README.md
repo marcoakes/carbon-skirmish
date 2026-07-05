@@ -25,8 +25,12 @@ Or play it live: **https://marcoakes.github.io/carbon-skirmish/**
 The title screen shows every control, and your first flight walks you through them
 step by step. **P** pauses and brings the control reference back at any time.
 
-- **WASD** — thrust. Your ship keeps inertia; feather it.
+- **WASD** — thrust. Your ship is a space battleship in the spirit of the *Yamato* —
+  she keeps her inertia and swings her bow slowly; feather it.
 - **Shift** — afterburner (drains capacitor).
+- **Space (hold)** — the **WAVE MOTION GUN**. Needs a full capacitor, slows you while
+  charging, then erases everything in a 2.6 km corridor ahead of the bow. Long recharge.
+  Aim it by flying — the ship fires where the bow points.
 - **Tab / click a hostile** — begin target lock. Once locked, turrets fire automatically
   when the target is inside 520 m.
 - Shield recharges, armor doesn't, hull is your life. Damage flows shield → armor → hull.

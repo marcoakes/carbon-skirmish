@@ -14,8 +14,10 @@
 <script>
 "use strict";
 /* =====================================================================
-   CARBON SKIRMISH v3
+   CARBON SKIRMISH v4
    A structural homage to CCP's open-sourced Carbon engine.
+   You fly a space battleship in the spirit of the Yamato — complete
+   with a Wave Motion Gun. Hold Space. You'll know.
 
    - Destiny : deterministic fixed-tick world simulation. Physics, AI,
                ballistics (transversal tracking!), webifiers, torpedoes,
@@ -52,11 +54,12 @@ const Destiny = (() => {
   /* metres, m/s, seconds. track = turret tracking in rad/s: your hit
      chance collapses as the target's angular velocity beats it. */
   const CLS = {
-    player:  { radius: 13, speed: 240, abSpeed: 430, inertia: 2.2,
+    player:  { radius: 13, speed: 240, abSpeed: 430, inertia: 2.2, turnRate: 2.4,
                shield: 330, sregen: 8, armor: 300, hull: 260,
                cap: 130, cregen: 8.5, abDrain: 15,
                gunDmg: 12, gunRof: 0.4, gunRange: 520, gunCost: 3,
-               pspeed: 1200, track: 1.6 },
+               pspeed: 1200, track: 1.6,
+               wmgDmg: 1300, wmgRange: 2600, wmgWidth: 80, wmgCharge: 2.6, wmgCd: 45, wmgDur: 0.75 },
     scout:   { radius: 9, speed: 265, orbit: 310, inertia: 3.2,
                shield: 35, sregen: 1.5, armor: 30, hull: 30,
                gunDmg: 5, gunRof: 1.1, gunRange: 470, pspeed: 900, track: 2.6,
@@ -121,6 +124,8 @@ const Destiny = (() => {
       abOn: false, capEmptyFlash: 0,
       webbedBy: [], wasWebbed: false, torpWarnT: 0,
       paused: false, clearedAnnounced: 0, waveStartT: 0, deathInfo: null,
+      wmg: { charge: 0, charging: false, cd: 0 },
+      beamT: 0, beamTickN: 0,
       stats: { shots: 0, hits: 0, endT: 0 }
     };
     S.player = makeShip('player', 'Your Ship', 0, 0);
@@ -244,6 +249,53 @@ const Destiny = (() => {
     sh.vx += dvx * k; sh.vy += dvy * k;
   }
 
+  /* the Wave Motion Gun: a sustained beam anchored to the bow. For
+     wmgDur seconds, everything in a 2600 m corridor ahead ceases to
+     exist — and the beam sweeps as the ship swings her bow. */
+  function fireWMG() {
+    const p = S.player, d = CLS.player;
+    S.wmg.charging = false; S.wmg.charge = 0; S.wmg.cd = d.wmgCd;
+    S.beamT = d.wmgDur; S.beamTickN = 0;
+    const ang = p.face;
+    S.events.push({ type: 'wmgfire',
+      x: p.x + Math.cos(ang) * p.radius * 3, y: p.y + Math.sin(ang) * p.radius * 3, ang });
+  }
+
+  function tickBeam() {
+    if (S.beamT <= 0) return;
+    const p = S.player, d = CLS.player;
+    if (!p.alive) { S.beamT = 0; return; }
+    S.beamT -= TICK;
+    S.beamTickN++;
+    const ang = p.face, dx = Math.cos(ang), dy = Math.sin(ang);
+    const ox = p.x + dx * p.radius * 3, oy = p.y + dy * p.radius * 3;
+    // damage lands in 0.1 s pulses so the event stream stays sane
+    if (S.beamTickN % 6 === 0) {
+      const pulse = d.wmgDmg * (6 * TICK) / d.wmgDur;
+      for (const sh of S.ships) {
+        if (!sh.alive || sh.faction !== 'hostile') continue;
+        const rx = sh.x - ox, ry = sh.y - oy;
+        const along = rx * dx + ry * dy;
+        if (along < 0 || along > d.wmgRange) continue;
+        const perp = Math.abs(rx * dy - ry * dx);
+        if (perp <= d.wmgWidth + sh.radius) applyDamage(sh, pulse, 'wmg');
+      }
+    }
+    // hostile fire entering the beam is vaporized continuously
+    let removed = false;
+    for (const pr of S.projectiles) {
+      if (!pr.hostileShot) continue;
+      const rx = pr.x - ox, ry = pr.y - oy;
+      const along = rx * dx + ry * dy;
+      const perp = Math.abs(rx * dy - ry * dx);
+      if (along >= 0 && along <= d.wmgRange && perp <= d.wmgWidth) {
+        pr.dead = true; removed = true;
+        if (pr.kind === 'torp') S.events.push({ type: 'torpboom', x: pr.x, y: pr.y, fizzle: true });
+      }
+    }
+    if (removed) S.projectiles = S.projectiles.filter(pr => !pr.dead);
+  }
+
   function setLockTarget(id) {
     if (S.lockTargetId === id) return;
     const t = S.ships.find(s => s.id === id && s.alive && s.faction === 'hostile');
@@ -265,10 +317,25 @@ const Destiny = (() => {
     if (webbed && !S.wasWebbed) S.events.push({ type: 'webbed' });
     S.wasWebbed = webbed;
 
+    // wave motion gun: hold to charge; needs a nearly full capacitor
+    const wm = S.wmg;
+    wm.cd = Math.max(0, wm.cd - TICK);
+    if (cmd.wmg && wm.cd <= 0 && (wm.charging || p.cap >= p.capMax * 0.9)) {
+      if (!wm.charging) { wm.charging = true; wm.charge = 0; S.events.push({ type: 'wmgstart' }); }
+      wm.charge += TICK / d.wmgCharge;
+      p.cap = Math.max(0, p.cap - p.capMax * 0.85 * TICK / d.wmgCharge);
+      if (wm.charge >= 1) fireWMG();
+    } else if (wm.charging) {
+      wm.charging = false; wm.charge = 0;
+      S.events.push({ type: 'wmgcancel' });
+    }
+
     // afterburner + thrust
-    S.abOn = cmd.ab && p.cap > 0.5;
+    S.abOn = cmd.ab && p.cap > 0.5 && !wm.charging;
     if (S.abOn) p.cap = Math.max(0, p.cap - d.abDrain * TICK);
-    const maxSpd = (S.abOn ? d.abSpeed : d.speed) * (webbed ? 0.5 : 1);
+    let maxSpd = (S.abOn ? d.abSpeed : d.speed) * (webbed ? 0.5 : 1);
+    if (wm.charging) maxSpd *= 0.35;        // braced for firing
+    else if (S.beamT > 0) maxSpd *= 0.5;    // holding the beam steady
 
     let ix = cmd.thrustX, iy = cmd.thrustY;
     const il = Math.hypot(ix, iy);
@@ -277,7 +344,14 @@ const Destiny = (() => {
       const k = 1 - Math.exp(-0.4 * TICK);
       p.vx -= p.vx * k; p.vy -= p.vy * k;
     }
-    if (Math.hypot(p.vx, p.vy) > 8) p.face = Math.atan2(p.vy, p.vx);
+    // a battleship swings her bow with real inertia
+    if (Math.hypot(p.vx, p.vy) > 8) {
+      const want = Math.atan2(p.vy, p.vx);
+      let diff = want - p.face;
+      while (diff > Math.PI) diff -= TAU;
+      while (diff < -Math.PI) diff += TAU;
+      p.face += clamp(diff, -d.turnRate * TICK, d.turnRate * TICK);
+    }
 
     // targeting
     if (cmd.lockId != null) setLockTarget(cmd.lockId);
@@ -470,6 +544,7 @@ const Destiny = (() => {
     if (S.player.alive) tickPlayer(cmd);
     for (const sh of S.ships) if (sh.alive && sh !== S.player) tickHostile(sh);
     for (const sh of S.ships) if (sh.alive) { sh.x += sh.vx * TICK; sh.y += sh.vy * TICK; }
+    tickBeam();
     tickProjectiles();
     tickWrecks();
     if (S.mode === 'play') tickWaves();
@@ -726,42 +801,76 @@ const Trinity = (() => {
     };
 
     if (cls === 'player') {
-      // drop shadow for volume
-      x.save(); x.translate(0, U * 0.12);
-      poly([[1.55, 0], [0.25, 0.55], [-0.5, 1.1], [-1.0, 0.6], [-0.72, 0], [-1.0, -0.6], [-0.5, -1.1], [0.25, -0.55]]);
-      x.fillStyle = 'rgba(0,0,0,0.5)'; x.fill(); x.restore();
-      // hull
-      poly([[1.55, 0], [0.25, 0.55], [-0.5, 1.1], [-1.0, 0.6], [-0.72, 0], [-1.0, -0.6], [-0.5, -1.1], [0.25, -0.55]]);
-      x.fillStyle = grad(-U, U, [[0, '#5d7a99'], [0.45, '#31435a'], [1, '#1a2534']]);
+      // ——— the space battleship: red lower hull, grey deck, pagoda bridge ———
+      const HULL = [[1.98, 0], [1.55, 0.16], [0.85, 0.32], [0.1, 0.42], [-0.75, 0.47],
+                    [-1.45, 0.44], [-1.85, 0.30], [-1.97, 0.12],
+                    [-1.97, -0.12], [-1.85, -0.30], [-1.45, -0.44], [-0.75, -0.47],
+                    [0.1, -0.42], [0.85, -0.32], [1.55, -0.16]];
+      // drop shadow
+      x.save(); x.translate(0, U * 0.1);
+      poly(HULL); x.fillStyle = 'rgba(0,0,0,0.5)'; x.fill(); x.restore();
+      // stabiliser fins (red, near stern)
+      x.fillStyle = '#7e2a26'; x.strokeStyle = '#b8534a'; x.lineWidth = U * 0.03;
+      poly([[-1.1, 0.42], [-1.5, 0.74], [-1.72, 0.66], [-1.45, 0.38]]); x.fill(); x.stroke();
+      poly([[-1.1, -0.42], [-1.5, -0.74], [-1.72, -0.66], [-1.45, -0.38]]); x.fill(); x.stroke();
+      // red lower hull, visible along the flanks
+      poly(HULL);
+      x.fillStyle = '#8c2f28'; x.fill();
+      x.strokeStyle = '#c05a50'; x.lineWidth = U * 0.04; x.stroke();
+      // grey main deck, inset
+      poly(HULL.map(([hx, hy]) => [hx, hy * 0.74]));
+      x.fillStyle = grad(-U * 0.4, U * 0.4, [[0, '#9aa4b2'], [0.5, '#6d7684'], [1, '#454d59']]);
       x.fill();
-      x.strokeStyle = '#7d9cbd'; x.lineWidth = U * 0.055; x.stroke();
-      // spine
-      poly([[1.55, 0], [0.2, 0.3], [-0.6, 0], [0.2, -0.3]]);
-      x.fillStyle = grad(-U * 0.3, U * 0.3, [[0, '#7c9cc0'], [0.5, '#4a6480'], [1, '#33475e']]);
-      x.fill();
-      // panel lines
-      x.strokeStyle = 'rgba(8,14,22,0.55)'; x.lineWidth = U * 0.04;
-      x.beginPath(); x.moveTo(0.55 * U, 0.16 * U); x.lineTo(-0.55 * U, 0.52 * U);
-      x.moveTo(0.55 * U, -0.16 * U); x.lineTo(-0.55 * U, -0.52 * U);
-      x.moveTo(-0.15 * U, 0.7 * U); x.lineTo(-0.62 * U, 0.85 * U);
-      x.moveTo(-0.15 * U, -0.7 * U); x.lineTo(-0.62 * U, -0.85 * U);
-      x.stroke();
-      // engine nacelles
-      for (const sy of [0.62, -0.62]) {
-        x.fillStyle = '#141c28';
-        x.beginPath(); x.ellipse(-0.82 * U, sy * U, 0.22 * U, 0.14 * U, 0, 0, TAU); x.fill();
-        x.fillStyle = 'rgba(140,220,255,0.9)';
-        x.beginPath(); x.ellipse(-0.94 * U, sy * U, 0.08 * U, 0.09 * U, 0, 0, TAU); x.fill();
+      x.strokeStyle = '#a8b2c0'; x.lineWidth = U * 0.025; x.stroke();
+      // transverse panel lines
+      x.strokeStyle = 'rgba(10,16,24,0.4)'; x.lineWidth = U * 0.022;
+      x.beginPath();
+      for (const [xs, hw] of [[1.35, 0.17], [0.95, 0.23], [0.45, 0.28], [-0.35, 0.32], [-0.9, 0.33], [-1.35, 0.31]]) {
+        x.moveTo(xs * U, -hw * U); x.lineTo(xs * U, hw * U);
       }
-      // wingtip accents
-      x.fillStyle = '#57d8ff';
-      poly([[-0.42, 1.06], [-0.56, 1.16], [-0.68, 1.0], [-0.52, 0.96]]); x.fill();
-      poly([[-0.42, -1.06], [-0.56, -1.16], [-0.68, -1.0], [-0.52, -0.96]]); x.fill();
-      // cockpit
-      const ck = x.createRadialGradient(0.55 * U, -0.05 * U, 0, 0.5 * U, 0, 0.32 * U);
-      ck.addColorStop(0, '#eafaff'); ck.addColorStop(0.5, '#7fd0f0'); ck.addColorStop(1, '#2a7aa8');
-      x.fillStyle = ck;
-      x.beginPath(); x.ellipse(0.5 * U, 0, 0.3 * U, 0.15 * U, 0, 0, TAU); x.fill();
+      x.stroke();
+      // red bow chevron
+      x.fillStyle = '#c04038';
+      poly([[1.96, 0], [1.62, 0.09], [1.62, -0.09]]); x.fill();
+      // wave motion gun muzzle
+      x.fillStyle = '#10151c';
+      x.beginPath(); x.arc(1.7 * U, 0, 0.13 * U, 0, TAU); x.fill();
+      x.strokeStyle = '#7d93ad'; x.lineWidth = U * 0.03; x.stroke();
+      x.fillStyle = '#6fd8ff';
+      x.beginPath(); x.arc(1.7 * U, 0, 0.05 * U, 0, TAU); x.fill();
+      // triple-barrel turrets (two fore, one aft)
+      const turret = (tx0, dir) => {
+        x.strokeStyle = '#39424e'; x.lineWidth = U * 0.045;
+        x.beginPath();
+        for (const off of [-0.08, 0, 0.08]) {
+          x.moveTo((tx0 + dir * 0.08) * U, off * U);
+          x.lineTo((tx0 + dir * 0.5) * U, off * U);
+        }
+        x.stroke();
+        x.fillStyle = '#525c6b';
+        x.beginPath(); x.arc(tx0 * U, 0, 0.17 * U, 0, TAU); x.fill();
+        x.strokeStyle = '#2c333d'; x.lineWidth = U * 0.028; x.stroke();
+        x.fillStyle = '#6b7686';
+        x.beginPath(); x.arc((tx0 - dir * 0.03) * U, -0.03 * U, 0.09 * U, 0, TAU); x.fill();
+      };
+      turret(1.16, 1); turret(0.64, 1); turret(-1.08, -1);
+      // pagoda bridge superstructure
+      x.fillStyle = '#454e5c'; x.fillRect(-0.55 * U, -0.16 * U, 0.75 * U, 0.32 * U);
+      x.fillStyle = '#5a6472'; x.fillRect(-0.42 * U, -0.11 * U, 0.5 * U, 0.22 * U);
+      x.fillStyle = '#6e7a8a'; x.fillRect(-0.30 * U, -0.07 * U, 0.3 * U, 0.14 * U);
+      x.fillStyle = '#8b97a8';
+      x.beginPath(); x.arc(-0.12 * U, 0, 0.065 * U, 0, TAU); x.fill();
+      // funnel, raked back
+      x.fillStyle = '#39414c';
+      poly([[-0.62, 0.11], [-0.86, 0.13], [-0.9, -0.13], [-0.66, -0.11]]); x.fill();
+      x.fillStyle = '#c04038';
+      poly([[-0.84, 0.128], [-0.9, 0.13], [-0.9, -0.13], [-0.86, -0.128]]); x.fill();
+      // stern engine block
+      x.fillStyle = '#141a22'; x.fillRect(-1.99 * U, -0.2 * U, 0.16 * U, 0.4 * U);
+      x.fillStyle = 'rgba(140,220,255,0.9)';
+      for (const sy of [-0.11, 0.11]) {
+        x.beginPath(); x.ellipse(-1.97 * U, sy * U, 0.045 * U, 0.07 * U, 0, 0, TAU); x.fill();
+      }
     }
     else if (cls === 'cruiser') {
       x.save(); x.translate(0, U * 0.1);
@@ -868,7 +977,7 @@ const Trinity = (() => {
   }
   // nav lights per class (unit-r coords, colour, blink phase)
   const NAV = {
-    player: [[-0.5, 1.05, '#6aff9a', 0], [-0.5, -1.05, '#ff6a5a', 2.1]],
+    player: [[-1.35, 0.62, '#6aff9a', 0], [-1.35, -0.62, '#ff6a5a', 2.1], [1.7, 0, '#7fdcff', 1.3]],
     scout: [[-0.7, 0.6, '#ff6a5a', 1]],
     frigate: [[-0.9, 0.86, '#ff6a5a', 0.5], [-0.9, -0.86, '#6aff9a', 1.7]],
     escort: [[-0.9, 0.86, '#ff6a5a', 0.5], [-0.9, -0.86, '#6aff9a', 1.7]],
@@ -906,6 +1015,7 @@ const Trinity = (() => {
 
   /* ---------------- transient render state ---------------- */
   let particles = [], floaters = [], rings = [], flashes = [], pending = [];
+  let screenFlash = 0;
   let killFeed = [], banner = null, shake = 0, redFlash = 0, lockPulse = 0;
   const trails = new Map();
   const shieldFx = new Map();       // shipId -> {t}
@@ -1007,6 +1117,11 @@ const Trinity = (() => {
           break;
         case 'banner': banner = { text: e.text, sub: e.sub, life: 4.5 }; break;
         case 'lock': lockPulse = 1; break;
+        case 'wmgfire':
+          screenFlash = 0.55;
+          shake = Math.min(34, shake + 26);
+          flashes.push({ x: e.x, y: e.y, r: 260, life: 0.3, max: 0.3, img: GLOW.cyan });
+          break;
       }
     }
   }
@@ -1015,7 +1130,7 @@ const Trinity = (() => {
   function drawShip(S, sh, lerp, now) {
     const x = w2sx(sh.px + (sh.x - sh.px) * lerp);
     const y = w2sy(sh.py + (sh.y - sh.py) * lerp);
-    const rPx = Math.max(7, sh.radius * scale * 1.7);
+    const rPx = Math.max(7, sh.radius * scale * (sh.cls === 'player' ? 2.2 : 1.7));
     const spr = SPR[sh.cls] || SPR.scout;
     const drawSize = (rPx / spr.U) * spr.size;
 
@@ -1043,21 +1158,22 @@ const Trinity = (() => {
 
     // engine glow + exhaust cone behind hull
     g.globalCompositeOperation = 'lighter';
+    const tail = rPx * (isPlayer ? 1.9 : sh.cls === 'cruiser' ? 1.45 : 0.8);
     if (spd > 12) {
-      const ex = x - Math.cos(sh.face) * rPx * 0.95;
-      const ey = y - Math.sin(sh.face) * rPx * 0.95;
+      const ex = x - Math.cos(sh.face) * tail;
+      const ey = y - Math.sin(sh.face) * tail;
       const eR = rPx * (0.7 + spd / 300) * (ab ? 1.9 : 1);
       glow(ex, ey, eR, isPlayer ? (ab ? GLOW.white : GLOW.cyan) : GLOW.orange, ab ? 0.95 : 0.6);
       // exhaust cone
       const flick = 0.75 + Math.random() * 0.5;
       const fl = rPx * (1.2 + spd / 160) * flick * (ab ? 1.9 : 1);
       g.save(); g.translate(x, y); g.rotate(sh.face);
-      const eg = g.createLinearGradient(-rPx * 0.8, 0, -rPx * 0.8 - fl, 0);
+      const eg = g.createLinearGradient(-tail, 0, -tail - fl, 0);
       eg.addColorStop(0, isPlayer ? (ab ? 'rgba(220,245,255,0.85)' : 'rgba(120,210,255,0.6)') : 'rgba(255,170,90,0.55)');
       eg.addColorStop(1, 'rgba(0,0,0,0)');
       g.fillStyle = eg;
       g.beginPath();
-      g.moveTo(-rPx * 0.8, rPx * 0.3); g.lineTo(-rPx * 0.8 - fl, 0); g.lineTo(-rPx * 0.8, -rPx * 0.3);
+      g.moveTo(-tail, rPx * 0.3); g.lineTo(-tail - fl, 0); g.lineTo(-tail, -rPx * 0.3);
       g.closePath(); g.fill();
       g.restore();
       // thruster sparks
@@ -1346,6 +1462,74 @@ const Trinity = (() => {
     // ships & wrecks
     for (const sh of S.ships) drawShip(S, sh, lerp, now);
 
+    // ---- wave motion gun: charge-up at the bow, then the beam ----
+    const wm = S.wmg;
+    if (wm && wm.charging && p.alive) {
+      const bowD = p.radius * 4.3;
+      const bwx = ptx + Math.cos(p.face) * bowD, bwy = pty + Math.sin(p.face) * bowD;
+      const bx4 = w2sx(bwx), by4 = w2sy(bwy);
+      g.globalCompositeOperation = 'lighter';
+      // aim corridor
+      g.strokeStyle = 'rgba(120,215,255,' + (0.15 + 0.3 * wm.charge).toFixed(2) + ')';
+      g.setLineDash([10, 14]);
+      g.lineWidth = 2;
+      g.beginPath();
+      g.moveTo(bx4, by4);
+      g.lineTo(bx4 + Math.cos(p.face) * 2600 * scale, by4 + Math.sin(p.face) * 2600 * scale);
+      g.stroke();
+      g.setLineDash([]);
+      // energy gathering at the muzzle
+      glow(bx4, by4, (10 + 52 * wm.charge) * (1 + 0.15 * Math.sin(now * 40)), GLOW.cyan, 0.35 + 0.65 * wm.charge);
+      glow(bx4, by4, 8 + 22 * wm.charge, GLOW.white, wm.charge);
+      g.strokeStyle = 'rgba(150,225,255,0.7)';
+      for (let i = 0; i < 6; i++) {
+        const a = Math.random() * TAU;
+        const d0 = (14 + 70 * (1 - wm.charge)) * scale + 8;
+        g.beginPath();
+        g.moveTo(bx4 + Math.cos(a) * d0, by4 + Math.sin(a) * d0);
+        g.lineTo(bx4 + Math.cos(a) * d0 * 0.35, by4 + Math.sin(a) * d0 * 0.35);
+        g.stroke();
+      }
+      const cr = (80 * (1 - wm.charge) + 14) * scale;
+      g.strokeStyle = 'rgba(140,220,255,' + (0.3 + 0.5 * wm.charge).toFixed(2) + ')';
+      g.beginPath(); g.arc(bx4, by4, cr, 0, TAU); g.stroke();
+      g.lineWidth = 1;
+      g.globalCompositeOperation = 'source-over';
+    }
+    if (S.beamT > 0 && p.alive) {
+      g.globalCompositeOperation = 'lighter';
+      const dur = 0.75;
+      const prog = 1 - S.beamT / dur;
+      const env = Math.min(1, prog * 10 + 0.15, S.beamT * 2.8);
+      const x1 = w2sx(ptx + Math.cos(p.face) * p.radius * 3);
+      const y1 = w2sy(pty + Math.sin(p.face) * p.radius * 3);
+      const dxb = Math.cos(p.face), dyb = Math.sin(p.face);
+      const x2 = x1 + dxb * 2600 * scale, y2 = y1 + dyb * 2600 * scale;
+      for (const [w, cr2, cg2, cb2, a] of [[170, 90, 170, 255, 0.2], [90, 140, 210, 255, 0.4], [40, 210, 240, 255, 0.75], [14, 255, 255, 255, 0.95]]) {
+        g.strokeStyle = 'rgba(' + cr2 + ',' + cg2 + ',' + cb2 + ',' + (a * env).toFixed(3) + ')';
+        g.lineWidth = Math.max(1, w * scale * (0.6 + 0.4 * env));
+        g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+      }
+      // spiral energy strands
+      g.lineWidth = Math.max(1, 5 * scale);
+      for (const ph of [0, Math.PI]) {
+        g.strokeStyle = 'rgba(180,235,255,' + (0.55 * env).toFixed(3) + ')';
+        g.beginPath();
+        for (let s4 = 0; s4 <= 2600; s4 += 65) {
+          const off = Math.sin(s4 * 0.02 + ph + now * 34) * 34 * scale * env;
+          const px4 = x1 + dxb * s4 * scale - dyb * off;
+          const py4 = y1 + dyb * s4 * scale + dxb * off;
+          s4 === 0 ? g.moveTo(px4, py4) : g.lineTo(px4, py4);
+        }
+        g.stroke();
+      }
+      glow(x1, y1, (170 * env + 30) * scale + 20, GLOW.cyan, env);
+      glow(x1, y1, (70 * env + 14) * scale + 10, GLOW.white, env);
+      shake = Math.min(30, shake + 40 * dtF);
+      g.lineWidth = 1;
+      g.globalCompositeOperation = 'source-over';
+    }
+
     // ---- transient FX ----
     for (const pd of pending) pd.t -= dtF;
     pending = pending.filter(pd => { if (pd.t <= 0) { addBoom(pd.x, pd.y, pd.r, pd.big); return false; } return true; });
@@ -1463,6 +1647,38 @@ const Trinity = (() => {
     if (S.abOn) {
       sctx.fillStyle = '#9fe0ff'; sctx.font = 'bold 10px Consolas,monospace'; sctx.textAlign = 'center';
       sctx.fillText('AFTERBURNER', cx, cy + 62);
+    }
+  }
+
+  function drawWmgStatus(S) {
+    const wm = S.wmg;
+    if (!wm) return;
+    const x = 16, y = H - 84, w = 216, h = 64;
+    sctx.fillStyle = 'rgba(7,12,20,0.75)';
+    roundRectPath(sctx, x, y, w, h, 8); sctx.fill();
+    sctx.strokeStyle = wm.charging ? 'rgba(140,220,255,0.9)' : 'rgba(110,140,170,0.4)';
+    sctx.stroke();
+    sctx.fillStyle = '#9fc0dd'; sctx.font = 'bold 11px Consolas,monospace'; sctx.textAlign = 'left';
+    sctx.fillText('WAVE MOTION GUN', x + 12, y + 18);
+    const bx = x + 12, by = y + 26, bw = w - 24, bh = 10;
+    sctx.fillStyle = 'rgba(22,30,42,0.9)'; sctx.fillRect(bx, by, bw, bh);
+    let frac = 1, col = 'rgba(120,215,255,0.9)', label;
+    if (wm.cd > 0) { frac = 1 - wm.cd / 45; col = 'rgba(120,140,160,0.7)'; label = 'RECHARGING ' + Math.ceil(wm.cd) + 's'; }
+    else if (wm.charging) { frac = wm.charge; col = 'rgba(160,235,255,0.95)'; label = 'CHARGING ' + Math.round(wm.charge * 100) + '%'; }
+    else if (S.player.cap < S.player.capMax * 0.9) { frac = 0; col = 'rgba(120,140,160,0.7)'; label = 'NEEDS FULL CAPACITOR'; }
+    else label = 'READY — hold [Space]';
+    sctx.fillStyle = col; sctx.fillRect(bx, by, bw * clamp(frac, 0, 1), bh);
+    const ready = label.indexOf('READY') === 0;
+    const blink = Math.floor(performance.now() / 400) % 2 === 0;
+    sctx.fillStyle = wm.charging ? '#bfe9ff' : ready ? (blink ? '#bfe9ff' : '#7d9cb8') : '#7d93a8';
+    sctx.font = 'bold 11px Consolas,monospace';
+    sctx.fillText(label, x + 12, y + 54);
+    if (wm.charging) {
+      sctx.save();
+      sctx.shadowColor = 'rgba(140,220,255,0.9)'; sctx.shadowBlur = 22;
+      sctx.fillStyle = '#dff4ff'; sctx.font = 'bold 24px Consolas,monospace'; sctx.textAlign = 'center';
+      sctx.fillText('WAVE MOTION GUN — ' + Math.round(wm.charge * 100) + '%', W / 2, H * 0.3);
+      sctx.restore();
     }
   }
 
@@ -1688,7 +1904,7 @@ const Trinity = (() => {
   }
 
   function drawControlCards(topY) {
-    const cw = 340, ch = 218, gap = 24;
+    const cw = 340, ch = 268, gap = 24;
     const twoCol = W > cw * 2 + gap + 40;
     const x1 = twoCol ? W / 2 - cw - gap / 2 : W / 2 - cw / 2;
     const x2 = twoCol ? W / 2 + gap / 2 : x1;
@@ -1717,14 +1933,16 @@ const Trinity = (() => {
     row(topY + 100, 'Shift', 'Afterburner (drains capacitor)');
     row(topY + 128, 'Tab', 'Lock next hostile');
     row(topY + 156, 'Click', 'Lock the ship you click');
-    row(topY + 184, 'P', 'Pause   ·   R restarts');
+    row(topY + 184, 'Space', 'Wave Motion Gun (hold)');
+    row(topY + 212, 'P', 'Pause   ·   R restarts');
 
     card(x2, y2, 'HOW TO WIN');
     const lines = [
       ['1.', 'Lock a target. Your turrets fire on', 'their own when it is inside 520 m.'],
       ['2.', 'Damage order: SHIELD → ARMOR → HULL.', 'Only your shield regenerates.'],
       ['3.', 'SPEED IS ARMOR — fast sideways motion', 'makes enemy turrets miss you.'],
-      ['4.', 'Survive 3 waves. Kill the cruiser', 'SANGUINE VESPER to secure the site.']
+      ['4.', 'Full capacitor? HOLD SPACE to charge', 'the WAVE MOTION GUN. It erases the lane.'],
+      ['5.', 'Survive 3 waves. Kill the cruiser', 'SANGUINE VESPER to secure the site.']
     ];
     let yy = y2 + 48;
     for (const [n, a, b] of lines) {
@@ -1762,9 +1980,9 @@ const Trinity = (() => {
         if (S.abOn) tut.step = 4;
         break;
       case 4:
-        segs = ['Perfect. Speed makes enemies miss. Clear all 3 waves — o7'];
+        segs = ['Perfect. Full cap + hold ', { key: 'Space' }, ' = WAVE MOTION GUN. o7'];
         tut.wait += dtF;
-        if (tut.wait > 3.5) tut.done = true;
+        if (tut.wait > 4) tut.done = true;
         break;
     }
     if (!segs) return;
@@ -1922,6 +2140,13 @@ const Trinity = (() => {
     sctx.globalAlpha = 1;
     sctx.globalCompositeOperation = 'source-over';
 
+    // wave motion gun white-out
+    if (screenFlash > 0.01) {
+      sctx.fillStyle = 'rgba(215,240,255,' + screenFlash.toFixed(2) + ')';
+      sctx.fillRect(0, 0, W, H);
+      screenFlash *= Math.exp(-5 * dtF);
+    }
+
     // 4) world-anchored UI (crisp, no bloom)
     floaters = floaters.filter(f => (f.life -= dtF) > 0);
     for (const f of floaters) {
@@ -1996,7 +2221,7 @@ const Trinity = (() => {
 
     // 7) HUD
     if (S.mode === 'play' || S.mode === 'dead') {
-      if (p.alive) drawCapWheel(S);
+      if (p.alive) { drawCapWheel(S); drawWmgStatus(S); }
       drawPanels(S);
       drawRadar(S);
     }
@@ -2020,6 +2245,11 @@ const Trinity = (() => {
    ===================================================================== */
 const Aura = (() => {
   let ac = null, master = null, noiseBuf = null, abGain = null;
+  let wmgOsc = null, wmgOscGain = null;
+
+  function stopWmg() {
+    if (wmgOsc) { try { wmgOsc.stop(); } catch (err) {} wmgOsc = null; wmgOscGain = null; }
+  }
 
   function ensure() {
     if (!ac) {
@@ -2087,6 +2317,23 @@ const Aura = (() => {
         case 'warpin': noise(0.45, 0.18, 300, 4200); break;
         case 'kill': blip(500, 0.15, 'triangle', 0.05, 700); break;
         case 'banner': blip(340, 0.25, 'sine', 0.05, 420); break;
+        case 'wmgstart':
+          stopWmg();
+          try {
+            wmgOsc = ac.createOscillator(); wmgOscGain = ac.createGain();
+            wmgOsc.type = 'sawtooth'; wmgOsc.frequency.value = 55;
+            wmgOscGain.gain.value = 0.02;
+            wmgOsc.connect(wmgOscGain); wmgOscGain.connect(master);
+            wmgOsc.start();
+          } catch (err) { wmgOsc = null; wmgOscGain = null; }
+          break;
+        case 'wmgcancel': stopWmg(); break;
+        case 'wmgfire':
+          stopWmg();
+          noise(2.4, 0.55, 1400, 35);
+          blip(44, 2.4, 'sine', 0.4, 18);
+          blip(220, 1.2, 'sawtooth', 0.12, 30);
+          break;
       }
     }
   }
@@ -2095,6 +2342,13 @@ const Aura = (() => {
     if (!ac || !abGain) return;
     const target = S.abOn ? 0.06 : 0;
     abGain.gain.setTargetAtTime(target, ac.currentTime, 0.08);
+    if (wmgOsc && S.wmg) {
+      if (!S.wmg.charging) stopWmg();
+      else {
+        wmgOsc.frequency.setTargetAtTime(55 + 1100 * S.wmg.charge * S.wmg.charge, ac.currentTime, 0.05);
+        wmgOscGain.gain.setTargetAtTime(0.02 + 0.07 * S.wmg.charge, ac.currentTime, 0.05);
+      }
+    }
   }
 
   return { ensure, handle, update };
@@ -2143,6 +2397,7 @@ const Input = (() => {
     const cmd = {
       thrustX: tx, thrustY: ty,
       ab: held.has('shift'),
+      wmg: held.has(' '),
       tab, restart, anyKey, pause,
       clickWorld: null, lockId: null
     };
