@@ -14,7 +14,7 @@
 <script>
 "use strict";
 /* =====================================================================
-   CARBON SKIRMISH v7 — FLEET COMMAND
+   CARBON SKIRMISH v8 — FLEET COMMAND
    A structural homage to CCP's open-sourced Carbon engine.
    You fly a space battleship in the spirit of the Yamato — complete
    with a Wave Motion Gun — and you are the FC of a five-ship wing.
@@ -112,6 +112,18 @@ const Destiny = (() => {
   const FLEET = [['tackle', 'Talon'], ['tackle', 'Grip'], ['dps', 'Hammer'], ['dps', 'Anvil'], ['logi', 'Mercy']];
   const ORDERS = ['focus', 'defend', 'free', 'regroup'];
 
+  // salvaged fittings, drafted between waves — stackable
+  const MODS = [
+    { id: 'track', name: 'Tracking Computer', desc: '+25% turret tracking' },
+    { id: 'gun', name: 'Gyrostabilizer', desc: '+15% turret damage' },
+    { id: 'rep', name: 'Armor Repairer', desc: '+3 armor/s passive repair' },
+    { id: 'cap', name: 'Cap Battery', desc: '+30% capacitor regen' },
+    { id: 'speed', name: 'Overdrive Injector', desc: '+12% max speed' },
+    { id: 'msl', name: 'Expanded Missile Bay', desc: '+2 missile rack (and +2 now)' },
+    { id: 'wmg', name: 'WMG Condenser', desc: 'Wave Motion Gun cooldown −10s' },
+    { id: 'lock', name: 'Sensor Booster', desc: 'Target locks 35% faster' }
+  ];
+
   let S = null;
   let nextId = 1;
 
@@ -152,6 +164,7 @@ const Destiny = (() => {
       pickups: [], score: 0, combo: 0, comboT: 0,
       overtime: false, otWave: 0, otCleared: 0, waveHullStart: 260,
       fleetOrder: 'focus', fleetLost: [], waveWingLost: false,
+      mods: {}, draft: null, killsBy: {}, heatOn: false, heatUsed: false, wmgCdMax: 45,
       stats: { shots: 0, hits: 0, endT: 0 }
     };
     S.player = makeShip('player', 'Your Ship', 0, 0);
@@ -243,7 +256,27 @@ const Destiny = (() => {
     }
   }
 
-  function applyDamage(sh, dmg, srcCls) {
+  const modN = id => S.mods[id] || 0;
+  const mslMax = () => 8 + 2 * modN('msl');
+
+  function offerDraft() {
+    const pool = MODS.slice();
+    S.draft = [];
+    for (let i = 0; i < 3; i++)
+      S.draft.push(pool.splice((rng() * pool.length) | 0, 1)[0]);
+    S.events.push({ type: 'draftoffer' });
+  }
+
+  function pickDraft(i) {
+    const m = S.draft && S.draft[i];
+    if (!m) return;
+    S.mods[m.id] = (S.mods[m.id] || 0) + 1;
+    if (m.id === 'msl') S.player.msl = Math.min(mslMax(), S.player.msl + 2);
+    S.draft = null;
+    S.events.push({ type: 'fitted', name: m.name });
+  }
+
+  function applyDamage(sh, dmg, srcCls, srcName) {
     let left = dmg, layer = 'hull';
     if (sh.shield > 0.5) layer = 'shield';
     else if (sh.armor > 0.5) layer = 'armor';
@@ -258,6 +291,8 @@ const Destiny = (() => {
       S.events.push({ type: 'boom', x: sh.x, y: sh.y, r: sh.radius, big: sh.cls === 'cruiser' });
       if (sh.faction === 'hostile') {
         S.kills++;
+        const credit = srcName ? (srcName === 'Your Ship' ? 'FC' : srcName) : 'FC';
+        S.killsBy[credit] = (S.killsBy[credit] || 0) + 1;
         // score, with a 6-second kill-chain multiplier
         const base = { scout: 100, frigate: 250, escort: 300, cruiser: 1500 }[sh.cls] || 100;
         S.combo = S.comboT > 0 ? S.combo + 1 : 1;
@@ -334,7 +369,7 @@ const Destiny = (() => {
       x: mx, y: my, px: mx, py: my,
       vx: Math.cos(ang) * speed, vy: Math.sin(ang) * speed,
       dmg, faction: sh.faction, life: range / speed + 0.7,
-      hostileShot: sh.faction === 'hostile', srcCls: sh.cls,
+      hostileShot: sh.faction === 'hostile', srcCls: sh.cls, srcName: sh.name,
       willHit: roll.hit, targetId: target.id,
       missT: roll.hit ? -1 : dist / speed
     });
@@ -366,7 +401,9 @@ const Destiny = (() => {
      exist — and the beam sweeps as the ship swings her bow. */
   function fireWMG() {
     const p = S.player, d = CLS.player;
-    S.wmg.charging = false; S.wmg.charge = 0; S.wmg.cd = d.wmgCd;
+    S.wmg.charging = false; S.wmg.charge = 0;
+    S.wmgCdMax = Math.max(15, d.wmgCd - 10 * modN('wmg'));
+    S.wmg.cd = S.wmgCdMax;
     S.beamT = d.wmgDur; S.beamTickN = 0;
     const ang = p.face;
     S.events.push({ type: 'wmgfire',
@@ -390,7 +427,7 @@ const Destiny = (() => {
         const along = rx * dx + ry * dy;
         if (along < 0 || along > d.wmgRange) continue;
         const perp = Math.abs(rx * dy - ry * dx);
-        if (perp <= d.wmgWidth + sh.radius) applyDamage(sh, pulse, 'wmg');
+        if (perp <= d.wmgWidth + sh.radius) applyDamage(sh, pulse, 'wmg', 'Your Ship');
       }
     }
     // hostile fire entering the beam is vaporized continuously
@@ -413,16 +450,25 @@ const Destiny = (() => {
     const t = S.ships.find(s => s.id === id && s.alive && s.faction === 'hostile');
     if (!t) return;
     S.lockTargetId = id; S.locked = false; S.lockProgress = 0;
-    S.lockNeed = CLS[t.cls].lock || 2;
+    S.lockNeed = (CLS[t.cls].lock || 2) * Math.pow(0.65, modN('lock'));
   }
 
   function tickPlayer(cmd) {
     const p = S.player, d = CLS.player;
 
-    // fleet broadcast
-    if (cmd.order && ORDERS.indexOf(cmd.order) >= 0 && S.fleetOrder !== cmd.order) {
+    // fitting draft is modal on the number keys while open
+    if (S.draft) {
+      if (cmd.pick >= 1 && cmd.pick <= S.draft.length) pickDraft(cmd.pick - 1);
+    } else if (cmd.order && ORDERS.indexOf(cmd.order) >= 0 && S.fleetOrder !== cmd.order) {
       S.fleetOrder = cmd.order;
       S.events.push({ type: 'order', order: cmd.order });
+    }
+
+    // overheat: push the ship past redline, burning your own hull
+    S.heatOn = !!cmd.heat && p.hull > 16;
+    if (S.heatOn) {
+      p.hull -= 4 * TICK;
+      if (!S.heatUsed) { S.heatUsed = true; S.events.push({ type: 'heaton' }); }
     }
 
     // webifiers
@@ -452,6 +498,8 @@ const Destiny = (() => {
     S.abOn = cmd.ab && p.cap > 0.5 && !wm.charging;
     if (S.abOn) p.cap = Math.max(0, p.cap - d.abDrain * TICK);
     let maxSpd = (S.abOn ? d.abSpeed : d.speed) * (webbed ? 0.5 : 1);
+    maxSpd *= 1 + 0.12 * modN('speed');
+    if (S.heatOn) maxSpd *= 1.3;
     if (wm.charging) maxSpd *= 0.35;        // braced for firing
     else if (S.beamT > 0) maxSpd *= 0.5;    // holding the beam steady
 
@@ -504,8 +552,9 @@ const Destiny = (() => {
       if (dist <= d.gunRange) {
         if (p.cap >= d.gunCost) {
           p.cap -= d.gunCost;
-          fire(p, tgt, d.gunDmg * rr(0.85, 1.15), d.pspeed, d.gunRange + 200, d.track);
-          p.gunCd = d.gunRof;
+          fire(p, tgt, d.gunDmg * (1 + 0.15 * modN('gun')) * rr(0.85, 1.15),
+            d.pspeed, d.gunRange + 200, d.track * (1 + 0.25 * modN('track')));
+          p.gunCd = d.gunRof / (S.heatOn ? 1.5 : 1);
           p.muzzle = -p.muzzle;
         } else { S.capEmptyFlash = 1.2; p.gunCd = 0.3; }
       }
@@ -530,7 +579,8 @@ const Destiny = (() => {
     }
 
     p.shield = Math.min(p.shieldMax, p.shield + d.sregen * TICK);
-    p.cap = Math.min(p.capMax, p.cap + d.cregen * TICK);
+    if (modN('rep')) p.armor = Math.min(p.armorMax, p.armor + 3 * modN('rep') * TICK);
+    p.cap = Math.min(p.capMax, p.cap + d.cregen * (1 + 0.3 * modN('cap')) * TICK);
     if (S.capEmptyFlash > 0) S.capEmptyFlash -= TICK;
   }
 
@@ -707,7 +757,7 @@ const Destiny = (() => {
         if (t && Math.hypot(t.x - pr.x, t.y - pr.y) <= t.radius + 8) {
           pr.dead = true;
           S.events.push({ type: 'boom', x: pr.x, y: pr.y, r: 6 });
-          applyDamage(t, pr.dmg, 'missile');
+          applyDamage(t, pr.dmg, 'missile', 'Your Ship');
         } else if (pr.life <= 0) pr.dead = true;
         continue;
       }
@@ -730,7 +780,7 @@ const Destiny = (() => {
           pr.vx = Math.cos(cur) * spd; pr.vy = Math.sin(cur) * spd;
           if (Math.hypot(t.x - pr.x, t.y - pr.y) <= t.radius + 5) {
             pr.dead = true;
-            applyDamage(t, pr.dmg, pr.srcCls);
+            applyDamage(t, pr.dmg, pr.srcCls, pr.srcName);
           }
         } else pr.willHit = false;
       } else if (pr.missT >= 0) {
@@ -773,7 +823,7 @@ const Destiny = (() => {
         pk.dead = true;
         if (pk.type === 'cap') p.cap = Math.min(p.capMax, p.cap + 40);
         else if (pk.type === 'armor') p.armor = Math.min(p.armorMax, p.armor + 60);
-        else if (pk.type === 'ammo') p.msl = Math.min(8, p.msl + 2);
+        else if (pk.type === 'ammo') p.msl = Math.min(mslMax(), p.msl + 2);
         else S.wmg.cd = Math.max(0, S.wmg.cd - 15);
         S.events.push({ type: 'pickup', x: pk.x, y: pk.y, ptype: pk.type });
       }
@@ -830,6 +880,7 @@ const Destiny = (() => {
         spawnWing(wr, wn);
         S.events.push({ type: 'wingback', name: wn });
       }
+      offerDraft();
     }
     if (S.overtime && S.otCleared < S.otWave) {
       S.otCleared = S.otWave;
@@ -843,7 +894,9 @@ const Destiny = (() => {
         spawnWing(wr, wn);
         S.events.push({ type: 'wingback', name: wn });
       }
+      offerDraft();
     }
+    if (S.draft) return;   // holding the grid while you fit modules
     S.waveDelay -= TICK;
     if (S.waveDelay <= 0) {
       if (S.overtime) spawnOvertimeWave();
@@ -855,10 +908,17 @@ const Destiny = (() => {
 
   function tick(cmd) {
     if (S.mode === 'intro') {
-      if (cmd.anyKey) { S.mode = 'play'; S.waveDelay = 0.4; spawnFleet(); }
+      if (cmd.anyKey) {
+        S.mode = 'play'; S.waveDelay = 0.4; spawnFleet();
+        S.events.push({ type: 'warpin', x: S.player.x, y: S.player.y, ang: -Math.PI / 2, big: true, fc: true });
+      }
       return;
     }
-    if (cmd.restart) { reset(); S.mode = 'play'; S.waveDelay = 0.4; spawnFleet(); return; }
+    if (cmd.restart) {
+      reset(); S.mode = 'play'; S.waveDelay = 0.4; spawnFleet();
+      S.events.push({ type: 'warpin', x: S.player.x, y: S.player.y, ang: -Math.PI / 2, big: true, fc: true });
+      return;
+    }
     if (S.mode === 'victory' && cmd.overtime) {
       S.mode = 'play'; S.overtime = true; S.waveDelay = 1.5;
     }
@@ -1384,7 +1444,7 @@ const Trinity = (() => {
   let particles = [], floaters = [], rings = [], flashes = [], pending = [];
   let screenFlash = 0;
   let killFeed = [], banner = null, shake = 0, redFlash = 0, lockPulse = 0, zoomPulse = 0;
-  let comms = [], lowWingT = 0;
+  let comms = [], lowWingT = 0, warpFx = 0, killcam = null;
   const pick = a => a[(Math.random() * a.length) | 0];
   function say(line) {
     if (comms.length && comms[0].txt === line) return;
@@ -1456,7 +1516,10 @@ const Trinity = (() => {
     const S = Destiny.state();
     for (const e of evts) {
       switch (e.type) {
-        case 'boom': addBoom(e.x, e.y, e.r, e.big); break;
+        case 'boom':
+          addBoom(e.x, e.y, e.r, e.big);
+          if (e.big) killcam = { x: e.x, y: e.y, t: 1.6 };   // savor the cruiser kill
+          break;
         case 'torpboom':
           if (!e.fizzle) addBoom(e.x, e.y, 12, false);
           else flashes.push({ x: e.x, y: e.y, r: 24, life: 0.2, max: 0.2, img: GLOW.orange });
@@ -1488,6 +1551,7 @@ const Trinity = (() => {
             img: e.player ? GLOW.gold : GLOW.red, ang: e.ang, star: true });
           break;
         case 'warpin': {
+          if (e.fc) warpFx = 1;   // the FC arrives in style
           flashes.push({ x: e.x, y: e.y, r: e.big ? 170 : 90, life: 0.35, max: 0.35, img: GLOW.white });
           rings.push({ x: e.x, y: e.y, r: 6, max: e.big ? 200 : 110, life: 0.5, t: 0, warp: true });
           for (let i = 0; i < 20; i++) {
@@ -1509,6 +1573,9 @@ const Trinity = (() => {
         case 'wingdown': say('Mercy > we lost ' + e.name + '!'); break;
         case 'wingback': say(e.name + ' > back on grid, FC'); break;
         case 'webbed': say(pick(COMMS.webbed)); break;
+        case 'draftoffer': say('Mercy > salvage teams stripped the wrecks — fittings available, FC'); break;
+        case 'fitted': say('Mercy > ' + e.name + ' fitted and hot'); break;
+        case 'heaton': say("Grip > you're overheating, FC — watch the hull"); break;
         case 'score':
           floaters.push({ x: e.x, y: e.y, txt: '+' + e.pts + (e.combo > 1 ? '  ×' + e.combo : ''),
             life: 1.3, col: '#ffd978', big: e.combo > 1 });
@@ -1615,6 +1682,16 @@ const Trinity = (() => {
     g.save(); g.translate(x, y); g.rotate(sh.face);
     g.drawImage(spr.cv, -drawSize / 2, -drawSize / 2, drawSize, drawSize);
     g.restore();
+
+    // overheat: the hull glows angry and sheds sparks
+    if (isPlayer && S.heatOn) {
+      g.globalCompositeOperation = 'lighter';
+      glow(x, y, rPx * 1.9, GLOW.orange, 0.3 + 0.15 * Math.sin(now * 25));
+      g.globalCompositeOperation = 'source-over';
+      if (Math.random() < 0.5)
+        particles.push({ x: sh.x, y: sh.y, vx: (Math.random() - 0.5) * 70, vy: (Math.random() - 0.5) * 70,
+          life: 0.3, max: 0.3, kind: 'spark', sz: 1.5 });
+    }
 
     // nav lights
     const nav = NAV[sh.cls];
@@ -2150,6 +2227,7 @@ const Trinity = (() => {
       if (Math.floor(performance.now() / 250) % 2 === 0) sctx.fillText(txt, cx, wy);
       wy -= 18;
     };
+    if (S.heatOn) warn('OVERHEATING — HULL BURNING', '#ff9c5a');
     if (S.capEmptyFlash > 0) warn('CAPACITOR EMPTY', '#ff8c5a');
     if (S.webbedBy.length) warn('WEBBED — SPEED REDUCED', '#5affc8');
     if (S.projectiles.some(pr => pr.kind === 'torp')) warn('TORPEDO INBOUND', '#ffb35a');
@@ -2167,10 +2245,12 @@ const Trinity = (() => {
     const x = 16, y = H - 84, w = 216, h = 64;
     // missile rack
     sctx.fillStyle = '#9fc0dd'; sctx.font = 'bold 11px Consolas,monospace'; sctx.textAlign = 'left';
-    sctx.fillText('MISSILES [F]', x + 12, y - 12);
-    for (let i = 0; i < 8; i++) {
+    sctx.fillText('MISSILES [F]  ·  [G] overheat', x + 12, y - 12);
+    const mm = 8 + 2 * ((S.mods && S.mods.msl) || 0);
+    const sp2 = mm > 8 ? 8 : 13, pw = mm > 8 ? 6 : 9;
+    for (let i = 0; i < mm; i++) {
       sctx.fillStyle = i < S.player.msl ? '#a8ffd8' : 'rgba(60,70,80,0.6)';
-      sctx.fillRect(x + 108 + i * 13, y - 21, 9, 11);
+      sctx.fillRect(x + 108 + i * sp2, y - 21, pw, 11);
     }
     sctx.fillStyle = 'rgba(7,12,20,0.75)';
     roundRectPath(sctx, x, y, w, h, 8); sctx.fill();
@@ -2181,7 +2261,7 @@ const Trinity = (() => {
     const bx = x + 12, by = y + 26, bw = w - 24, bh = 10;
     sctx.fillStyle = 'rgba(22,30,42,0.9)'; sctx.fillRect(bx, by, bw, bh);
     let frac = 1, col = 'rgba(120,215,255,0.9)', label;
-    if (wm.cd > 0) { frac = 1 - wm.cd / 45; col = 'rgba(120,140,160,0.7)'; label = 'RECHARGING ' + Math.ceil(wm.cd) + 's'; }
+    if (wm.cd > 0) { frac = 1 - wm.cd / (S.wmgCdMax || 45); col = 'rgba(120,140,160,0.7)'; label = 'RECHARGING ' + Math.ceil(wm.cd) + 's'; }
     else if (wm.charging) { frac = wm.charge; col = 'rgba(160,235,255,0.95)'; label = 'CHARGING ' + Math.round(wm.charge * 100) + '%'; }
     else if (S.player.cap < S.player.capMax * 0.9) { frac = 0; col = 'rgba(120,140,160,0.7)'; label = 'NEEDS FULL CAPACITOR'; }
     else label = 'READY — hold [Space]';
@@ -2305,7 +2385,7 @@ const Trinity = (() => {
         sctx.font = '11px Consolas,monospace'; sctx.textAlign = 'left';
         sctx.fillText(s2.name, wx + 8, ry + 12);
         sctx.fillStyle = '#7d93a8'; sctx.font = '9px Consolas,monospace'; sctx.textAlign = 'right';
-        sctx.fillText(CLS_LABEL[s2.cls] || s2.cls, wx + ww - 8, ry + 12);
+        sctx.fillText((CLS_LABEL[s2.cls] || s2.cls) + (S.killsBy[s2.name] ? ' ·' + S.killsBy[s2.name] : ''), wx + ww - 8, ry + 12);
         sctx.textAlign = 'left';
         const bw3 = ww - 16;
         const mini = (yy, frac, col) => {
@@ -2360,6 +2440,51 @@ const Trinity = (() => {
     sctx.globalAlpha = 1;
   }
   const CLS_LABEL = { tackle: 'TACKLE', dps: 'DPS', logi: 'LOGI' };
+
+  // ---- fitting draft: pick 1 of 3 salvaged modules between waves ----
+  const draftRects = [];
+  function drawDraft(S) {
+    draftRects.length = 0;
+    if (!S.draft) return;
+    const cw2 = 208, chh = 120, gap2 = 18;
+    const totalW = Math.min(cw2 * 3 + gap2 * 2, W - 20);
+    const x0 = W / 2 - totalW / 2, y0 = Math.max(120, H * 0.28);
+    sctx.fillStyle = 'rgba(2,4,9,0.45)';
+    sctx.fillRect(0, 0, W, H);
+    sctx.save();
+    sctx.shadowColor = 'rgba(255,215,120,0.7)'; sctx.shadowBlur = 16;
+    sctx.fillStyle = '#ffe9b0'; sctx.font = 'bold 20px Consolas,monospace'; sctx.textAlign = 'center';
+    sctx.fillText('SALVAGED FITTINGS — CHOOSE ONE', W / 2, y0 - 26);
+    sctx.restore();
+    S.draft.forEach((m, i) => {
+      const x = x0 + i * (cw2 + gap2);
+      sctx.fillStyle = 'rgba(10,16,26,0.92)';
+      roundRectPath(sctx, x, y0, cw2, chh, 10); sctx.fill();
+      sctx.strokeStyle = 'rgba(255,215,120,' + (0.35 + 0.25 * Math.sin(performance.now() / 300 + i * 2)).toFixed(2) + ')';
+      sctx.lineWidth = 1.5; sctx.stroke(); sctx.lineWidth = 1;
+      drawKey(x + 12, y0 + 12, String(i + 1));
+      sctx.fillStyle = '#e6edf5'; sctx.font = 'bold 13px Consolas,monospace'; sctx.textAlign = 'left';
+      sctx.fillText(m.name, x + 48, y0 + 28);
+      sctx.fillStyle = '#9fb8cc'; sctx.font = '11px Consolas,monospace';
+      const words = m.desc.split(' ');
+      let line = '', ly = y0 + 56;
+      for (const wd of words) {
+        if ((line + wd).length > 27) { sctx.fillText(line, x + 14, ly); ly += 15; line = ''; }
+        line += wd + ' ';
+      }
+      if (line) sctx.fillText(line, x + 14, ly);
+      const owned = (S.mods && S.mods[m.id]) || 0;
+      if (owned) {
+        sctx.fillStyle = '#ffd978'; sctx.font = 'bold 10px Consolas,monospace';
+        sctx.fillText('FITTED ×' + owned, x + 14, y0 + chh - 12);
+      }
+      sctx.fillStyle = 'rgba(140,170,200,0.6)'; sctx.font = '10px Consolas,monospace';
+      sctx.textAlign = 'right';
+      sctx.fillText('press ' + (i + 1) + ' or click', x + cw2 - 12, y0 + chh - 12);
+      sctx.textAlign = 'left';
+      draftRects.push({ x, y: y0, w: cw2, h: chh, pick: i + 1 });
+    });
+  }
 
   function drawRadar(S) {
     const p = S.player, R = 74, cx = W - R - 20, cy = H - R - 20, range = 2200;
@@ -2517,7 +2642,7 @@ const Trinity = (() => {
   }
 
   function drawControlCards(topY) {
-    const cw = 340, ch = 324, gap = 24;
+    const cw = 340, ch = 352, gap = 24;
     const twoCol = W > cw * 2 + gap + 40;
     const x1 = twoCol ? W / 2 - cw - gap / 2 : W / 2 - cw / 2;
     const x2 = twoCol ? W / 2 + gap / 2 : x1;
@@ -2549,7 +2674,8 @@ const Trinity = (() => {
     row(topY + 184, 'Space', 'Wave Motion Gun (hold)');
     row(topY + 212, 'F', 'Fire missile at locked target');
     row(topY + 240, '1-4', 'Fleet orders — focus/defend/free/regroup');
-    row(topY + 268, 'P', 'Pause   ·   R restarts');
+    row(topY + 268, 'G', 'OVERHEAT — burn hull for speed + rate of fire');
+    row(topY + 296, 'P', 'Pause   ·   R restarts');
 
     card(x2, y2, 'HOW TO WIN');
     const lines = [
@@ -2694,11 +2820,15 @@ const Trinity = (() => {
       sctx.fillText('RATING: ' + rating + '   ·   SCORE ' + S.score.toLocaleString()
         + (newRecord ? '  — NEW RECORD' : ''), W / 2, H * 0.4 + 60);
       sctx.restore();
+      let mvp = null, mk = 0;
+      for (const nm in S.killsBy) if (nm !== 'FC' && S.killsBy[nm] > mk) { mk = S.killsBy[nm]; mvp = nm; }
+      sctx.fillStyle = '#9cc8d8'; sctx.font = '13px Consolas,monospace';
+      sctx.fillText('FC: ' + (S.killsBy.FC || 0) + ' kills' + (mvp ? '   ·   Top gun: ' + mvp + ' — ' + mk + ' kills' : ''), W / 2, H * 0.4 + 82);
       sctx.fillStyle = '#a8e8c0'; sctx.font = 'bold 15px Consolas,monospace';
       if (Math.floor(performance.now() / 500) % 2 === 0)
-        sctx.fillText('press N for OVERTIME — endless reinforcements, keep your score', W / 2, H * 0.4 + 92);
+        sctx.fillText('press N for OVERTIME — endless reinforcements, keep your score', W / 2, H * 0.4 + 110);
       sctx.fillStyle = '#eaf2fa'; sctx.font = '13px Consolas,monospace';
-      sctx.fillText('or press R to fly the site again', W / 2, H * 0.4 + 116);
+      sctx.fillText('or press R to fly the site again', W / 2, H * 0.4 + 134);
     }
   }
 
@@ -2714,9 +2844,20 @@ const Trinity = (() => {
     // camera: lead ahead of velocity so motion reads instantly
     const ptx = p.px + (p.x - p.px) * lerp, pty = p.py + (p.y - p.py) * lerp;
     const lead = S.mode === 'play' || S.mode === 'dead' ? 0.55 : 0;
-    cam.x += (ptx + p.vx * lead - cam.x) * (1 - Math.exp(-3.2 * dtF));
-    cam.y += (pty + p.vy * lead - cam.y) * (1 - Math.exp(-3.2 * dtF));
-    const zoomT = (S.abOn ? 0.86 : 1) * (1 + 0.05 * zoomPulse);
+    let camTX = ptx + p.vx * lead, camTY = pty + p.vy * lead;
+    let zoomT = (S.abOn ? 0.86 : 1) * (1 + 0.05 * zoomPulse);
+    if (killcam) {   // linger on the big kill
+      killcam.t -= dtF;
+      if (killcam.t <= 0) killcam = null;
+      else {
+        const mix = 0.85 * Math.sin(clamp(killcam.t / 1.6, 0, 1) * Math.PI);
+        camTX += (killcam.x - camTX) * mix;
+        camTY += (killcam.y - camTY) * mix;
+        zoomT *= 1 + 0.3 * mix;
+      }
+    }
+    cam.x += (camTX - cam.x) * (1 - Math.exp(-3.2 * dtF));
+    cam.y += (camTY - cam.y) * (1 - Math.exp(-3.2 * dtF));
     zoomK += (zoomT - zoomK) * (1 - Math.exp(-2.5 * dtF));
     zoomPulse *= Math.exp(-4 * dtF);
     scale = (H / 1350) * zoomK;
@@ -2778,6 +2919,26 @@ const Trinity = (() => {
       sctx.fillStyle = 'rgba(215,240,255,' + screenFlash.toFixed(2) + ')';
       sctx.fillRect(0, 0, W, H);
       screenFlash *= Math.exp(-5 * dtF);
+    }
+
+    // warp arrival: radial streaks collapsing as you drop out of warp
+    if (warpFx > 0.01) {
+      sctx.globalCompositeOperation = 'lighter';
+      sctx.lineWidth = 1.5;
+      for (let i = 0; i < 36; i++) {
+        const a = (i / 36) * TAU + 0.35;
+        const r1 = ((120 + i * 47) % (H * 0.7)) + H * 0.12;
+        const x1 = W / 2 + Math.cos(a) * r1 * (1.7 - warpFx * 0.7);
+        const y1 = H / 2 + Math.sin(a) * r1 * (1.7 - warpFx * 0.7);
+        sctx.strokeStyle = 'rgba(160,210,255,' + (0.5 * warpFx).toFixed(2) + ')';
+        sctx.beginPath();
+        sctx.moveTo(x1, y1);
+        sctx.lineTo(x1 + Math.cos(a) * 150 * warpFx, y1 + Math.sin(a) * 150 * warpFx);
+        sctx.stroke();
+      }
+      sctx.lineWidth = 1;
+      sctx.globalCompositeOperation = 'source-over';
+      warpFx *= Math.exp(-2.2 * dtF);
     }
 
     // 4) world-anchored UI (crisp, no bloom)
@@ -2861,7 +3022,10 @@ const Trinity = (() => {
       drawRadar(S);
       drawFleetUI(S, dtF);
     }
-    if (S.mode === 'play' && !S.paused) drawTutorial(S, dtF);
+    if (S.mode === 'play' && !S.paused) {
+      drawTutorial(S, dtF);
+      drawDraft(S);
+    }
     overlay(S);
   }
 
@@ -2871,6 +3035,11 @@ const Trinity = (() => {
     overviewHit: (x, y) => {
       for (const r of overviewRows)
         if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return r.id;
+      return null;
+    },
+    draftHit: (x, y) => {
+      for (const r of draftRects)
+        if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return r.pick;
       return null;
     }
   };
@@ -2982,6 +3151,9 @@ const Aura = (() => {
         case 'order': blip(700, 0.07, 'sine', 0.05, 950); break;
         case 'wingdown': blip(180, 0.5, 'sine', 0.12, 60); break;
         case 'wingback': blip(520, 0.2, 'sine', 0.06, 780); break;
+        case 'draftoffer': blip(660, 0.15, 'sine', 0.06, 880); blip(880, 0.2, 'sine', 0.05, 1170); break;
+        case 'fitted': blip(880, 0.12, 'sine', 0.07, 1170); break;
+        case 'heaton': noise(0.4, 0.1, 2200, 500); break;
         case 'bosslance':
           if (e.phase === 'charge') blip(90, 3, 'sawtooth', 0.08, 750, pan);
           else { noise(1.4, 0.4, 1000, 60, pan); blip(58, 1.2, 'sine', 0.3, 28, pan); }
@@ -3031,7 +3203,7 @@ const Aura = (() => {
    ===================================================================== */
 const Input = (() => {
   const held = new Set();
-  let tab = false, restart = false, anyKey = false, pause = false, overtimeKey = false, missileKey = false, orderKey = null, click = null;
+  let tab = false, restart = false, anyKey = false, pause = false, overtimeKey = false, missileKey = false, orderKey = null, pickKey = 0, click = null;
   const ORDER_KEYS = { 1: 'focus', 2: 'defend', 3: 'free', 4: 'regroup' };
   const ALIAS = { arrowup: 'w', arrowdown: 's', arrowleft: 'a', arrowright: 'd', z: 'w', q: 'a' };
 
@@ -3049,6 +3221,7 @@ const Input = (() => {
     if (k === 'n') overtimeKey = true;
     if (k === 'f') missileKey = true;
     if (ORDER_KEYS[k]) orderKey = ORDER_KEYS[k];
+    if (k >= '1' && k <= '3') pickKey = +k;
   });
   window.addEventListener('keyup', e => {
     let k = e.key.toLowerCase();
@@ -3074,18 +3247,24 @@ const Input = (() => {
       thrustX: tx, thrustY: ty,
       ab: held.has('shift'),
       wmg: held.has(' '),
+      heat: held.has('g'),
       tab, restart, anyKey, pause,
       overtime: overtimeKey,
       missile: missileKey,
       order: orderKey,
+      pick: pickKey,
       clickWorld: null, lockId: null
     };
     if (click) {
-      const id = Trinity.overviewHit(click.x, click.y);
-      if (id != null) cmd.lockId = id;
-      else cmd.clickWorld = Trinity.screenToWorld(click.x, click.y);
+      const dp = Trinity.draftHit(click.x, click.y);
+      if (dp) cmd.pick = dp;
+      else {
+        const id = Trinity.overviewHit(click.x, click.y);
+        if (id != null) cmd.lockId = id;
+        else cmd.clickWorld = Trinity.screenToWorld(click.x, click.y);
+      }
     }
-    tab = false; restart = false; anyKey = false; pause = false; overtimeKey = false; missileKey = false; orderKey = null; click = null;
+    tab = false; restart = false; anyKey = false; pause = false; overtimeKey = false; missileKey = false; orderKey = null; pickKey = 0; click = null;
     return cmd;
   }
   return { consume };
