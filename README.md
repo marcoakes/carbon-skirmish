@@ -1,4 +1,7 @@
-# CARBON SKIRMISH
+# STAR BLAZERS — Carbon Skirmish
+
+*An unofficial fan tribute to Star Blazers / Space Battleship Yamato. Not affiliated
+with or endorsed by the rights holders — just love for the ship.*
 
 A single-level, browser-playable space battle built as a structural homage to CCP's
 open-sourced Carbon engine: the code is split into a **Destiny** module (deterministic

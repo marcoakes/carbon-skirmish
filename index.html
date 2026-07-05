@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>CARBON SKIRMISH</title>
+<title>STAR BLAZERS — Carbon Skirmish</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   html,body{margin:0;padding:0;background:#020409;overflow:hidden;height:100%}
@@ -14,7 +14,8 @@
 <script>
 "use strict";
 /* =====================================================================
-   CARBON SKIRMISH v8 — FLEET COMMAND
+   STAR BLAZERS — CARBON SKIRMISH v9
+   (an unofficial fan tribute to Star Blazers / Space Battleship Yamato)
    A structural homage to CCP's open-sourced Carbon engine.
    You fly a space battleship in the spirit of the Yamato — complete
    with a Wave Motion Gun — and you are the FC of a five-ship wing.
@@ -1444,7 +1445,7 @@ const Trinity = (() => {
   let particles = [], floaters = [], rings = [], flashes = [], pending = [];
   let screenFlash = 0;
   let killFeed = [], banner = null, shake = 0, redFlash = 0, lockPulse = 0, zoomPulse = 0;
-  let comms = [], lowWingT = 0, warpFx = 0, killcam = null;
+  let comms = [], lowWingT = 0, warpFx = 0, killcam = null, cine = 0;
   const pick = a => a[(Math.random() * a.length) | 0];
   function say(line) {
     if (comms.length && comms[0].txt === line) return;
@@ -1506,7 +1507,7 @@ const Trinity = (() => {
         sz: 1.2 + Math.random() * 1.6, ph: Math.random() * TAU });
     }
     rings.push({ x, y, r: 4, max: (big ? 280 : 60 + r * 3), life: big ? 0.9 : 0.5, t: 0 });
-    flashes.push({ x, y, r: (big ? 230 : 46 + r * 3), life: 0.13, max: 0.13, img: GLOW.white });
+    flashes.push({ x, y, r: (big ? 230 : 46 + r * 3), life: 0.13, max: 0.13, img: GLOW.white, spokes: true });
     shake = Math.min(28, shake + (big ? 24 : r * 0.5));
     if (big) for (let i = 1; i <= 6; i++)
       pending.push({ t: i * 0.15, x: x + (Math.random() - 0.5) * 100, y: y + (Math.random() - 0.5) * 100, r: 9, big: false });
@@ -1808,16 +1809,33 @@ const Trinity = (() => {
       const sy2 = (-1500 - cam.y * 0.04) * scale + H / 2;
       glow(sx2, sy2, 340 * scale + 130, GLOW.gold, 0.55);
       glow(sx2, sy2, 110 * scale + 46, GLOW.white, 0.95);
+      // anamorphic lens streak
+      const fw = 900 * scale + 240;
+      const fg = g.createLinearGradient(sx2 - fw / 2, sy2, sx2 + fw / 2, sy2);
+      fg.addColorStop(0, 'rgba(140,200,255,0)');
+      fg.addColorStop(0.5, 'rgba(200,230,255,0.5)');
+      fg.addColorStop(1, 'rgba(140,200,255,0)');
+      g.fillStyle = fg;
+      g.fillRect(sx2 - fw / 2, sy2 - 2, fw, 4);
     }
     g.globalCompositeOperation = 'source-over';
 
-    // planet
+    // planet, with a ring system passing behind and in front
     {
       const pz = 0.07;
       const sx2 = (2400 - cam.x * pz) * scale + W / 2;
       const sy2 = (1500 - cam.y * pz) * scale + H / 2;
       const pr = 560 * scale;
+      const ringR = pr * 0.72, ringB = pr * 0.2, ringRot = -0.38;
+      g.strokeStyle = 'rgba(205,195,225,0.26)';
+      g.lineWidth = Math.max(1.5, pr * 0.035);
+      g.beginPath(); g.ellipse(sx2, sy2, ringR, ringB, ringRot, Math.PI, TAU); g.stroke();
       g.drawImage(PLANET, sx2 - pr / 2, sy2 - pr / 2, pr, pr);
+      g.beginPath(); g.ellipse(sx2, sy2, ringR, ringB, ringRot, 0, Math.PI); g.stroke();
+      g.strokeStyle = 'rgba(160,150,190,0.13)';
+      g.lineWidth = Math.max(1, pr * 0.06);
+      g.beginPath(); g.ellipse(sx2, sy2, ringR * 1.14, ringB * 1.14, ringRot, 0, Math.PI); g.stroke();
+      g.lineWidth = 1;
     }
 
     // stars
@@ -2180,6 +2198,19 @@ const Trinity = (() => {
         g.moveTo(x - L, y); g.lineTo(x + L, y);
         g.moveTo(x, y - L); g.lineTo(x, y + L);
         g.stroke();
+      }
+      if (f.spokes) {   // classic anime detonation spikes
+        const x = w2sx(f.x), y = w2sy(f.y), L = f.r * scale * (1.9 - a * 0.6);
+        g.strokeStyle = 'rgba(255,245,225,' + (a * 0.85).toFixed(2) + ')';
+        g.lineWidth = 2;
+        for (let k2 = 0; k2 < 3; k2++) {
+          const aa = k2 * Math.PI / 3 + 0.35;
+          g.beginPath();
+          g.moveTo(x - Math.cos(aa) * L, y - Math.sin(aa) * L);
+          g.lineTo(x + Math.cos(aa) * L, y + Math.sin(aa) * L);
+          g.stroke();
+        }
+        g.lineWidth = 1;
       }
     }
     g.lineWidth = 1;
@@ -2749,22 +2780,109 @@ const Trinity = (() => {
     sctx.textAlign = 'left';
   }
 
+  // ---- STAR BLAZERS title art: starburst, arched gold logo, hero ship ----
+  function drawStarburst(cx, cy, R) {
+    const t = performance.now() / 1000;
+    sctx.save();
+    sctx.globalCompositeOperation = 'lighter';
+    const gr = sctx.createRadialGradient(cx, cy, 0, cx, cy, R);
+    gr.addColorStop(0, 'rgba(255,222,130,0.85)');
+    gr.addColorStop(0.25, 'rgba(255,180,60,0.32)');
+    gr.addColorStop(1, 'rgba(255,150,40,0)');
+    sctx.fillStyle = gr;
+    const rays = 22;
+    sctx.beginPath();
+    for (let i = 0; i < rays; i++) {
+      const a = (i / rays) * TAU + t * 0.03;
+      const len = R * (i % 2 ? 0.55 : 1) * (0.92 + 0.08 * Math.sin(t * 2 + i));
+      const wHalf = (TAU / rays) * 0.18;
+      sctx.moveTo(cx, cy);
+      sctx.lineTo(cx + Math.cos(a - wHalf) * len, cy + Math.sin(a - wHalf) * len);
+      sctx.lineTo(cx + Math.cos(a + wHalf) * len, cy + Math.sin(a + wHalf) * len);
+      sctx.closePath();
+    }
+    sctx.fill();
+    sctx.globalAlpha = 0.6;
+    sctx.drawImage(GLOW.gold, cx - R * 0.5, cy - R * 0.5, R, R);
+    sctx.globalAlpha = 1;
+    sctx.restore();
+  }
+  function drawArchedText(txt, cx, baseY, radius, spread, size) {
+    sctx.save();
+    sctx.font = '900 ' + size + 'px Impact, "Arial Black", sans-serif';
+    sctx.textAlign = 'center'; sctx.textBaseline = 'alphabetic';
+    sctx.shadowColor = 'rgba(255,190,70,0.75)'; sctx.shadowBlur = 22;
+    const n = txt.length;
+    for (let i = 0; i < n; i++) {
+      const a = (n === 1 ? 0 : i / (n - 1) - 0.5) * spread;
+      const x = cx + Math.sin(a) * radius;
+      const y = baseY + radius - Math.cos(a) * radius;
+      sctx.save();
+      sctx.translate(x, y);
+      sctx.rotate(a);
+      const gr = sctx.createLinearGradient(0, -size, 0, size * 0.2);
+      gr.addColorStop(0, '#fff2c0'); gr.addColorStop(0.55, '#ffc233'); gr.addColorStop(1, '#e07818');
+      sctx.strokeStyle = '#6e2510'; sctx.lineWidth = size * 0.09;
+      sctx.strokeText(txt[i], 0, 0);
+      sctx.fillStyle = gr;
+      sctx.fillText(txt[i], 0, 0);
+      sctx.restore();
+    }
+    sctx.restore();
+    sctx.textBaseline = 'alphabetic';
+  }
+  function drawHeroShip() {
+    const t = performance.now() / 1000;
+    const spr = SPR.player;
+    const x = W * 0.76, y = H * 0.58 + Math.sin(t * 0.8) * 9;
+    const size = Math.min(W, H) * 0.52;
+    sctx.save();
+    sctx.translate(x, y);
+    sctx.rotate(-0.62);
+    sctx.globalCompositeOperation = 'lighter';
+    const wake = sctx.createLinearGradient(-size * 0.48, 0, -size * 1.5, 0);
+    wake.addColorStop(0, 'rgba(140,215,255,0.65)');
+    wake.addColorStop(1, 'rgba(140,215,255,0)');
+    sctx.fillStyle = wake;
+    sctx.beginPath();
+    sctx.moveTo(-size * 0.46, size * 0.045);
+    sctx.lineTo(-size * 1.5, 0);
+    sctx.lineTo(-size * 0.46, -size * 0.045);
+    sctx.closePath(); sctx.fill();
+    sctx.drawImage(GLOW.cyan, -size * 0.62 - 45, -45, 90, 90);
+    sctx.globalCompositeOperation = 'source-over';
+    sctx.drawImage(spr.cv, -size / 2, -size / 2, size, size);
+    sctx.restore();
+  }
+
   function overlay(S) {
     if (S.mode === 'intro') {
-      sctx.fillStyle = 'rgba(2,4,9,0.55)'; sctx.fillRect(0, 0, W, H);
-      const ty = Math.max(84, H * 0.14);
+      sctx.fillStyle = 'rgba(2,4,9,0.62)'; sctx.fillRect(0, 0, W, H);
+      // scorched red planet horizon, rising from the bottom of frame
+      const pcy = H + H * 0.78, prr = H * 1.04;
+      const pg = sctx.createRadialGradient(W / 2, pcy, prr * 0.5, W / 2, pcy, prr);
+      pg.addColorStop(0, 'rgba(60,12,8,0.95)');
+      pg.addColorStop(0.86, 'rgba(150,45,22,0.9)');
+      pg.addColorStop(0.975, 'rgba(255,140,70,0.95)');
+      pg.addColorStop(1, 'rgba(255,200,130,0)');
+      sctx.fillStyle = pg;
+      sctx.beginPath(); sctx.arc(W / 2, pcy, prr, 0, TAU); sctx.fill();
+      drawHeroShip();
+      const ly = Math.max(140, H * 0.185);
+      drawStarburst(W / 2, ly - 24, Math.min(W, H) * 0.44);
+      drawArchedText('STAR BLAZERS', W / 2, ly, 560, 0.6, Math.min(80, W / 13));
       sctx.textAlign = 'center';
-      sctx.save();
-      sctx.shadowColor = 'rgba(100,180,255,0.9)'; sctx.shadowBlur = 34;
-      sctx.fillStyle = '#eaf2fa'; sctx.font = 'bold 52px Consolas,monospace';
-      sctx.fillText('CARBON SKIRMISH', W / 2, ty);
-      sctx.restore();
-      sctx.fillStyle = '#8fa4b8'; sctx.font = '14px Consolas,monospace';
-      sctx.fillText('Destiny simulates. Trinity draws. You fly.', W / 2, ty + 30);
-      const bottom = drawControlCards(ty + 58);
+      sctx.fillStyle = '#ff9d5c'; sctx.font = 'bold 16px Consolas,monospace';
+      sctx.fillText('—  C A R B O N   S K I R M I S H  —', W / 2, ly + 42);
+      sctx.fillStyle = '#8fa4b8'; sctx.font = '12px Consolas,monospace';
+      sctx.fillText('an unofficial fan tribute · Destiny simulates, Trinity draws, you fly', W / 2, ly + 62);
+      const bottom = drawControlCards(ly + 82);
       if (Math.floor(performance.now() / 500) % 2 === 0) {
-        sctx.fillStyle = '#eaf2fa'; sctx.font = 'bold 17px Consolas,monospace'; sctx.textAlign = 'center';
-        sctx.fillText('— press any key to warp in —', W / 2, bottom + 42);
+        sctx.save();
+        sctx.shadowColor = 'rgba(255,200,90,0.9)'; sctx.shadowBlur = 14;
+        sctx.fillStyle = '#ffe9b0'; sctx.font = 'bold 17px Consolas,monospace'; sctx.textAlign = 'center';
+        sctx.fillText('— press any key to launch —', W / 2, Math.min(bottom + 40, H - 16));
+        sctx.restore();
       }
     } else if (S.mode === 'play' && S.paused) {
       sctx.fillStyle = 'rgba(2,4,9,0.62)'; sctx.fillRect(0, 0, W, H);
@@ -2941,6 +3059,27 @@ const Trinity = (() => {
       warpFx *= Math.exp(-2.2 * dtF);
     }
 
+    // anime speed lines under afterburner
+    if (S.abOn && S.mode === 'play' && !S.paused) {
+      const va = Math.atan2(p.vy, p.vx);
+      sctx.globalCompositeOperation = 'lighter';
+      sctx.strokeStyle = 'rgba(190,220,250,0.12)';
+      sctx.lineWidth = 2;
+      for (let i = 0; i < 10; i++) {
+        const off = (Math.random() - 0.5) * H * 1.1;
+        if (Math.abs(off) < H * 0.18) continue;   // keep the ship's lane clear
+        const px5 = W / 2 - Math.cos(va) * W * 0.25 - Math.sin(va) * off;
+        const py5 = H / 2 - Math.sin(va) * W * 0.25 + Math.cos(va) * off;
+        const len = 90 + Math.random() * 260;
+        sctx.beginPath();
+        sctx.moveTo(px5, py5);
+        sctx.lineTo(px5 - Math.cos(va) * len, py5 - Math.sin(va) * len);
+        sctx.stroke();
+      }
+      sctx.lineWidth = 1;
+      sctx.globalCompositeOperation = 'source-over';
+    }
+
     // 4) world-anchored UI (crisp, no bloom)
     floaters = floaters.filter(f => (f.life -= dtF) > 0);
     for (const f of floaters) {
@@ -3026,6 +3165,17 @@ const Trinity = (() => {
       drawTutorial(S, dtF);
       drawDraft(S);
     }
+
+    // cinema letterbox during the money moments
+    const cineTarget = ((S.wmg && S.wmg.charging) || S.beamT > 0 || killcam) ? 1 : 0;
+    cine += (cineTarget - cine) * (1 - Math.exp(-5 * dtF));
+    if (cine > 0.01) {
+      const bh = H * 0.08 * cine;
+      sctx.fillStyle = 'rgba(0,0,0,0.92)';
+      sctx.fillRect(0, 0, W, bh);
+      sctx.fillRect(0, H - bh, W, bh);
+    }
+
     overlay(S);
   }
 
