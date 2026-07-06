@@ -437,7 +437,7 @@ const Destiny = (() => {
     const dist = Math.hypot(target.x - fx, target.y - fy);
     S.projectiles.push({
       kind: 'shot',
-      x: mx, y: my, px: mx, py: my,
+      x: mx, y: my, px: mx, py: my, ox: mx, oy: my,
       vx: Math.cos(ang) * speed, vy: Math.sin(ang) * speed,
       dmg, faction: sh.faction, life: range / speed + 0.7,
       hostileShot: sh.faction === 'hostile', srcCls: sh.cls, srcName: sh.name,
@@ -658,9 +658,11 @@ const Destiny = (() => {
         if (Math.abs(rel) > 2.0) ti = 2;
         else { p.muzzle = -p.muzzle; ti = p.muzzle > 0 ? 0 : 1; }
         const slotX = [1.16, 0.64, -1.08][ti] * p.radius * 2.2;
+        // spawn at the barrel tip, clear of the hull, along the firing line
+        const bx5 = p.x + Math.cos(p.face) * slotX + Math.cos(ta) * p.radius * 1.3;
+        const by5 = p.y + Math.sin(p.face) * slotX + Math.sin(ta) * p.radius * 1.3;
         fire(p, batTgt, d.gunDmg * (1 + 0.15 * modN('gun')) * rr(0.85, 1.15),
-          d.pspeed, d.gunRange + 200, d.track * (1 + 0.25 * modN('track')),
-          p.x + Math.cos(p.face) * slotX, p.y + Math.sin(p.face) * slotX);
+          d.pspeed, d.gunRange + 200, d.track * (1 + 0.25 * modN('track')), bx5, by5);
         p.gunCd = d.gunRof / (S.heatOn ? 1.5 : 1);
       } else { S.capEmptyFlash = 1.2; p.gunCd = 0.3; }
     }
@@ -2386,33 +2388,35 @@ const Trinity = (() => {
         if (Math.random() < 0.55)
           particles.push({ x: pr.x, y: pr.y, vx: (Math.random() - 0.5) * 20, vy: (Math.random() - 0.5) * 20,
             life: 0.4, max: 0.4, kind: 'smoke', sz: 2.5 });
-      } else if (pr.hostileShot) {
-        const l = 0.018;
-        g.strokeStyle = 'rgba(255,80,55,0.5)';
-        g.lineWidth = 3.5;
-        g.beginPath(); g.moveTo(x, y);
-        g.lineTo(x - pr.vx * l * scale, y - pr.vy * l * scale); g.stroke();
-        g.strokeStyle = 'rgba(255,200,180,0.95)';
-        g.lineWidth = 1.4;
-        g.beginPath(); g.moveTo(x, y);
-        g.lineTo(x - pr.vx * l * 0.7 * scale, y - pr.vy * l * 0.7 * scale); g.stroke();
-        glow(x, y, 6, GLOW.red, 0.6);
       } else {
-        // the main battery fires coherent light: long blue-white laser bolts
-        const l = 0.07;
-        g.strokeStyle = 'rgba(110,185,255,0.4)';
-        g.lineWidth = 7;
-        g.beginPath(); g.moveTo(x, y);
-        g.lineTo(x - pr.vx * l * scale, y - pr.vy * l * scale); g.stroke();
-        g.strokeStyle = 'rgba(160,215,255,0.75)';
-        g.lineWidth = 3.2;
-        g.beginPath(); g.moveTo(x, y);
-        g.lineTo(x - pr.vx * l * 0.9 * scale, y - pr.vy * l * 0.9 * scale); g.stroke();
-        g.strokeStyle = 'rgba(245,252,255,0.95)';
-        g.lineWidth = 1.5;
-        g.beginPath(); g.moveTo(x, y);
-        g.lineTo(x - pr.vx * l * 0.75 * scale, y - pr.vy * l * 0.75 * scale); g.stroke();
-        glow(x, y, 11, GLOW.cyan, 0.7);
+        // tails are clamped at the muzzle so bolts never trail through the hull
+        const spd2 = Math.hypot(pr.vx, pr.vy) || 1;
+        const wxc = pr.px + (pr.x - pr.px) * lerp, wyc = pr.py + (pr.y - pr.py) * lerp;
+        const trav = pr.ox != null ? Math.hypot(wxc - pr.ox, wyc - pr.oy) : 1e9;
+        const ux = pr.vx / spd2, uy = pr.vy / spd2;
+        if (pr.hostileShot) {
+          const tail = Math.min(0.018 * spd2, trav) * scale;
+          g.strokeStyle = 'rgba(255,80,55,0.5)';
+          g.lineWidth = 3.5;
+          g.beginPath(); g.moveTo(x, y); g.lineTo(x - ux * tail, y - uy * tail); g.stroke();
+          g.strokeStyle = 'rgba(255,200,180,0.95)';
+          g.lineWidth = 1.4;
+          g.beginPath(); g.moveTo(x, y); g.lineTo(x - ux * tail * 0.7, y - uy * tail * 0.7); g.stroke();
+          glow(x, y, 6, GLOW.red, 0.6);
+        } else {
+          // the main battery fires coherent light: long blue-white laser bolts
+          const tail = Math.min(0.07 * spd2, trav) * scale;
+          g.strokeStyle = 'rgba(110,185,255,0.4)';
+          g.lineWidth = 7;
+          g.beginPath(); g.moveTo(x, y); g.lineTo(x - ux * tail, y - uy * tail); g.stroke();
+          g.strokeStyle = 'rgba(160,215,255,0.75)';
+          g.lineWidth = 3.2;
+          g.beginPath(); g.moveTo(x, y); g.lineTo(x - ux * tail * 0.9, y - uy * tail * 0.9); g.stroke();
+          g.strokeStyle = 'rgba(245,252,255,0.95)';
+          g.lineWidth = 1.5;
+          g.beginPath(); g.moveTo(x, y); g.lineTo(x - ux * tail * 0.75, y - uy * tail * 0.75); g.stroke();
+          glow(x, y, 11, GLOW.cyan, 0.7);
+        }
       }
     }
     g.lineWidth = 1;
@@ -3713,7 +3717,7 @@ const Aura = (() => {
   let ac = null, master = null, noiseBuf = null, abGain = null;
   let droneGain = null, engGain = null, engFilter = null;
   let wmgOsc = null, wmgOscGain = null, wmgSwellGain = null, wmgSwellFilter = null;
-  let musicGain = null, mNext = 0, mStep = 0, musicOn = true;
+  let musicGain = null, mNext = 0, mStep = 0, musicOn = true, gunEcho = null;
   try { musicOn = localStorage.getItem('cs_music') !== '0'; } catch (e) {}
   // A-minor battle theme data: chords, a walking bass, a pentatonic arp
   const CHORDS = [[0, 3, 7], [-2, 2, 5]];
@@ -3740,6 +3744,13 @@ const Aura = (() => {
         comp.connect(ac.destination);
         master = ac.createGain(); master.gain.value = 0.5; master.connect(comp);
         musicGain = ac.createGain(); musicGain.gain.value = 0; musicGain.connect(master);
+        // gun echo: a short damped feedback tail that makes energy weapons feel huge
+        gunEcho = ac.createDelay(0.5); gunEcho.delayTime.value = 0.09;
+        const efb = ac.createGain(); efb.gain.value = 0.32;
+        const edamp = ac.createBiquadFilter(); edamp.type = 'lowpass'; edamp.frequency.value = 2200;
+        gunEcho.connect(edamp); edamp.connect(efb); efb.connect(gunEcho);
+        const eout = ac.createGain(); eout.gain.value = 0.45;
+        edamp.connect(eout); eout.connect(master);
         const len = ac.sampleRate;
         noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
         const d = noiseBuf.getChannelData(0);
@@ -3847,30 +3858,37 @@ const Aura = (() => {
       switch (e.type) {
         case 'muzzle':
           if (e.player) {
-            // LASER CANNON: a bright descending zap driven through a
-            // soft-clipper (harmonics read on ANY speaker), plus a clean
-            // sub punch underneath for systems that can carry it
-            const pv = 0.92 + Math.random() * 0.16;
+            // LASER CANNON mk3: KSSH attack, vibrato dive-whine, distorted
+            // body and a clean sub punch — echoed so every shot feels huge.
+            // Distortion harmonics put the energy where ANY speaker can play it.
+            const pv = 0.94 + Math.random() * 0.12;
             const t0 = ac.currentTime;
             const dest = out(pan);
             const clip = ac.createWaveShaper();
             clip.curve = satCurve;
-            const cg = ac.createGain(); cg.gain.value = 0.85;
+            const cg = ac.createGain(); cg.gain.value = 0.9;
             clip.connect(cg); cg.connect(dest);
-            const zap = (type, f0, f1, dur, vol) => {
+            if (gunEcho) cg.connect(gunEcho);
+            const zap = (type, f0, f1, dur, vol, vib) => {
               const o = ac.createOscillator(), g = ac.createGain();
               o.type = type;
               o.frequency.setValueAtTime(f0 * pv, t0);
               o.frequency.exponentialRampToValueAtTime(f1, t0 + dur);
+              if (vib) {
+                const lf = ac.createOscillator(), lg = ac.createGain();
+                lf.frequency.value = 42; lg.gain.value = f0 * 0.12;
+                lf.connect(lg); lg.connect(o.frequency);
+                lf.start(t0); lf.stop(t0 + dur);
+              }
               g.gain.setValueAtTime(vol, t0);
               g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
               o.connect(g); g.connect(clip);
               o.start(t0); o.stop(t0 + dur + 0.02);
             };
-            zap('sawtooth', 1700, 130, 0.24, 0.17);   // the PSHEW
-            zap('square', 750, 95, 0.18, 0.08);       // body
-            blip(140 * pv, 0.2, 'sine', 0.24, 40, pan);   // sub punch
-            noise(0.05, 0.12, 5200, 1400, pan);           // muzzle snap
+            zap('sawtooth', 2300, 150, 0.28, 0.15, true);   // the dive
+            zap('square', 1150, 80, 0.2, 0.07, false);      // body
+            blip(135 * pv, 0.22, 'sine', 0.26, 40, pan);    // sub punch
+            noise(0.07, 0.16, 6500, 1100, pan);             // KSSH attack
           } else {
             blip(160, 0.09, 'sawtooth', 0.03, 55, pan);
             noise(0.06, 0.04, 1600, 300, pan);
@@ -3941,7 +3959,7 @@ const Aura = (() => {
       let inten = 0;
       if (S.mode === 'play' && !S.paused) inten = boss ? 3 : hn2 >= 4 ? 2 : hn2 >= 1 ? 1 : 0;
       const ducked = (S.wmg && S.wmg.charging) || S.beamT > 0;
-      musicGain.gain.setTargetAtTime(!musicOn ? 0 : ducked ? 0.05 : 0.3, t, ducked ? 0.05 : 0.6);
+      musicGain.gain.setTargetAtTime(!musicOn ? 0 : ducked ? 0.08 : 0.55, t, ducked ? 0.05 : 0.6);
       if (musicOn) {
         const stepD = 60 / 112 / 4;   // 112 BPM, 16th notes
         if (mNext < t) mNext = t + 0.05;   // resync after a tab-away
@@ -3949,22 +3967,22 @@ const Aura = (() => {
           const st2 = mStep % 16, bar = (mStep >> 4) % 2;
           const semis = CHORDS[bar];
           if (st2 === 0)   // pad
-            for (const sN of semis) tone(mNext, 110 * Math.pow(2, sN / 12), stepD * 16, 'sine', 0.04, 700);
+            for (const sN of semis) tone(mNext, 110 * Math.pow(2, sN / 12), stepD * 16, 'sine', 0.06, 700);
           if (st2 % 4 === 2)   // slow title arpeggio — the theme is always present
-            tone(mNext, 220 * Math.pow(2, ARP[((mStep >> 2) * 5) % ARP.length] / 12), stepD * 3.4, 'triangle', 0.03, 1200);
+            tone(mNext, 220 * Math.pow(2, ARP[((mStep >> 2) * 5) % ARP.length] / 12), stepD * 3.4, 'triangle', 0.05, 1200);
           if (inten >= 1) {
-            if (st2 % 4 === 0) tone(mNext, 150, 0.1, 'sine', 0.1, 0, 48);   // kick
+            if (st2 % 4 === 0) tone(mNext, 150, 0.1, 'sine', 0.16, 0, 48);   // kick
             const bN = BASS[st2];
-            if (bN >= 0) tone(mNext, 55 * Math.pow(2, (bN + (bar ? -2 : 0)) / 12), stepD * 1.6, 'sawtooth', 0.05, 260);
+            if (bN >= 0) tone(mNext, 55 * Math.pow(2, (bN + (bar ? -2 : 0)) / 12), stepD * 1.6, 'sawtooth', 0.09, 260);
           }
           if (inten >= 2) {
-            if (st2 === 4 || st2 === 12) noiseAt(mNext, 0.08, 0.05, 1900);   // snare
-            tone(mNext, 220 * Math.pow(2, ARP[(mStep * 3) % ARP.length] / 12), stepD * 0.9, 'triangle', 0.022, 1600);
+            if (st2 === 4 || st2 === 12) noiseAt(mNext, 0.08, 0.08, 1900);   // snare
+            tone(mNext, 220 * Math.pow(2, ARP[(mStep * 3) % ARP.length] / 12), stepD * 0.9, 'triangle', 0.04, 1600);
           }
           if (inten >= 3 && st2 === 0)   // detuned brass stabs for the bosses
             for (const sN of semis) {
-              tone(mNext, 110 * Math.pow(2, sN / 12), stepD * 6, 'sawtooth', 0.03, 900);
-              tone(mNext, 110 * Math.pow(2, sN / 12) * 1.007, stepD * 6, 'sawtooth', 0.025, 900);
+              tone(mNext, 110 * Math.pow(2, sN / 12), stepD * 6, 'sawtooth', 0.05, 900);
+              tone(mNext, 110 * Math.pow(2, sN / 12) * 1.007, stepD * 6, 'sawtooth', 0.04, 900);
             }
           mStep++; mNext += stepD;
         }
