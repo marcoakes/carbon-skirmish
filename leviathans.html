@@ -52,9 +52,9 @@ const Sim = (() => {
 
   // ---- squadron doctrine: three wings, three jobs ----
   const ROLES = {
-    INT: { hp: 55, spd: 305, turn: 4.2, dmgF: 7, dmgC: 3, range: 170, rof: 0.35, ammo: 34, label: 'INTERCEPTOR' },
-    BMB: { hp: 72, spd: 215, turn: 2.8, dmgF: 2, dmgC: 17, range: 285, rof: 0.9, ammo: 18, label: 'BOMBER' },
-    DEF: { hp: 88, spd: 265, turn: 3.6, dmgF: 5, dmgC: 2, range: 190, rof: 0.45, ammo: 30, label: 'DEFENDER' }
+    INT: { hp: 55, spd: 375, turn: 4.6, dmgF: 8, dmgC: 3, range: 180, rof: 0.32, ammo: 34, label: 'INTERCEPTOR' },
+    BMB: { hp: 72, spd: 275, turn: 3.1, dmgF: 2, dmgC: 22, range: 290, rof: 0.85, ammo: 18, label: 'BOMBER' },
+    DEF: { hp: 88, spd: 330, turn: 4.0, dmgF: 6, dmgC: 2, range: 200, rof: 0.42, ammo: 30, label: 'DEFENDER' }
   };
   const SQUADS = ['INT', 'BMB', 'DEF'];
 
@@ -70,9 +70,10 @@ const Sim = (() => {
   function makeCarrier(side, x, y, face) {
     const c = {
       side, x, y, vx: 0, vy: 0, face, radius: 150,
-      hull: 2600, hullMax: 2600, shield: 800, shieldMax: 800,
+      hull: 2200, hullMax: 2200, shield: 800, shieldMax: 800,
       subs: {}, power: { shields: 2, weapons: 2, engines: 2, hangar: 2 },
-      broadCd: 0, spinalCd: 0, launchCd: 0, pdCds: PD_MOUNTS.map(() => R() * 0.5),
+      broadCd: 0, spinalCd: 0, launchCd: 0, missCd: 0, pdCds: PD_MOUNTS.map(() => R() * 0.5),
+      wmg: { charge: 0, charging: false, cd: 0 },
       targetSub: 'hangar',   // which enemy subsystem the capital guns hammer
       dead: false
     };
@@ -98,13 +99,17 @@ const Sim = (() => {
       mode: 'title', t: 0, diff: DIFF[di], diffIdx: di,
       P: makeCarrier('P', -900, 0, 0),
       E: makeCarrier('E', 900, 0, Math.PI),
+      // she has no Wave Motion Gun; she brings armor instead
+      _: null,
       fighters: [], projectiles: [], events: [],
       sel: 0,                              // selected squadron (0..2), 3 = all
       aiThinkT: 0, aiRecallT: 0,
       stats: { lost: 0, saved: 0, dealt: 0, taken: 0, sorties: 0 },
       paused: false, winner: null, endT: 0,
+      beamT: 0, beamN: 0,
       tut: 0, tutT: 0
     };
+    S.E.hull = S.E.hullMax = 2900;
     for (let sq = 0; sq < 3; sq++)
       for (let sl = 0; sl < 4; sl++) {
         S.fighters.push(makeFighter('P', sq, sl));
@@ -179,7 +184,7 @@ const Sim = (() => {
     const foe = foeOf(c);
     // shields recharge only while the generator lives
     if (!c.subs.shieldgen.disabled)
-      c.shield = Math.min(c.shieldMax, c.shield + 7 * pw(c, 'shields') * TICK);
+      c.shield = Math.min(c.shieldMax, c.shield + 5 * pw(c, 'shields') * TICK);
     // disabled subsystems slowly patch back toward action if the hangar crews live
     for (const k of SUBKEYS) {
       const sub = c.subs[k];
@@ -220,7 +225,7 @@ const Sim = (() => {
         const my = c.y + PD_MOUNTS[m][0] * sa + PD_MOUNTS[m][1] * ca;
         let tgt = null, bd = 370, isTorp = false;
         for (const pr of S.projectiles)
-          if (pr.kind === 'storp' && pr.side !== c.side) {
+          if ((pr.kind === 'storp' || pr.kind === 'miss') && pr.side !== c.side) {
             const d = dist(mx, my, pr.x, pr.y);
             if (d < bd) { bd = d; tgt = pr; isTorp = true; }
           }
@@ -243,7 +248,7 @@ const Sim = (() => {
         } else c.pdCds[m] = 0.2;
       }
     }
-    c.broadCd -= TICK; c.spinalCd -= TICK; c.launchCd -= TICK;
+    c.broadCd -= TICK; c.spinalCd -= TICK; c.launchCd -= TICK; c.missCd -= TICK;
   }
 
   function killFighter(f) {
@@ -279,7 +284,7 @@ const Sim = (() => {
     const a = Math.atan2(ty - f.y, tx - f.x) + (R() - 0.5) * 0.09;
     S.projectiles.push({
       kind, side: f.side, x: f.x, y: f.y,
-      vx: Math.cos(a) * 720 + f.vx * 0.3, vy: Math.sin(a) * 720 + f.vy * 0.3,
+      vx: Math.cos(a) * 880 + f.vx * 0.3, vy: Math.sin(a) * 880 + f.vy * 0.3,
       dmg, life: 0.55
     });
     f.ammo--; f.gunCd = ROLES[f.role].rof;
@@ -395,6 +400,30 @@ const Sim = (() => {
         } else if (pr.life <= 0) pr.dead = true;
         continue;
       }
+      if (pr.kind === 'miss') {
+        // home on a fighter if assigned one still lives, else the enemy carrier's subsystem
+        const foe = pr.side === 'P' ? S.E : S.P;
+        let tx, ty;
+        const ft = pr.tFid ? S.fighters.find(f => f.id === pr.tFid && f.alive && f.state !== 'docked') : null;
+        if (ft) { tx = ft.x; ty = ft.y; }
+        else { const tp = subWorld(foe, pr.sub); tx = tp.x; ty = tp.y; }
+        const want = Math.atan2(ty - pr.y, tx - pr.x);
+        const cur = Math.atan2(pr.vy, pr.vx);
+        const na = cur + clamp(wrapA(want - cur), -pr.turn * TICK, pr.turn * TICK);
+        pr.vx = Math.cos(na) * pr.spd; pr.vy = Math.sin(na) * pr.spd;
+        pr.x += pr.vx * TICK; pr.y += pr.vy * TICK;
+        pr.life -= TICK;
+        if (ft && dist(pr.x, pr.y, ft.x, ft.y) < 16) {
+          pr.dead = true; ft.hp -= pr.dmg;
+          evt({ type: 'boom', x: pr.x, y: pr.y, r: 8 });
+          if (ft.hp <= 0) killFighter(ft);
+        } else if (!ft && !foe.dead && dist(pr.x, pr.y, foe.x, foe.y) < foe.radius) {
+          pr.dead = true;
+          evt({ type: 'boom', x: pr.x, y: pr.y, r: 12 });
+          hitCarrier(foe, 32, pr.x, pr.y);
+        } else if (pr.life <= 0) pr.dead = true;
+        continue;
+      }
       pr.x += pr.vx * TICK; pr.y += pr.vy * TICK;
       pr.life -= TICK;
       if (pr.life <= 0) { pr.dead = true; continue; }
@@ -431,7 +460,7 @@ const Sim = (() => {
     const flank = rel > 0 ? 1 : -1;             // starboard or port battery
     if (Math.abs(Math.abs(rel) - Math.PI / 2) > 0.95) return false;   // must present the flank
     if (dist(c.x, c.y, foe.x, foe.y) > 1500) return false;
-    c.broadCd = 3.6 / pw(c, 'weapons');
+    c.broadCd = 2.6 / pw(c, 'weapons');
     const ca = Math.cos(c.face), sa = Math.sin(c.face);
     BROADSIDE.forEach((b, i) => {
       const bx = c.x + b[0] * ca - b[1] * flank * sa;
@@ -440,7 +469,7 @@ const Sim = (() => {
       S.projectiles.push({
         kind: 'shell', side: c.side, x: bx, y: by,
         vx: Math.cos(a) * 620, vy: Math.sin(a) * 620,
-        dmg: 48 * pw(c, 'weapons'), life: 2.8, delay: i * 0.05
+        dmg: 62 * pw(c, 'weapons'), life: 2.8, delay: i * 0.05
       });
       evt({ type: 'broadside', x: bx, y: by, i });
     });
@@ -450,7 +479,7 @@ const Sim = (() => {
     if (c.dead || c.subs.weapons.disabled || c.spinalCd > 0) return false;
     const foe = foeOf(c);
     if (dist(c.x, c.y, foe.x, foe.y) > 2100) return false;
-    c.spinalCd = 24;
+    c.spinalCd = 16;
     for (let i = 0; i < 3; i++) {
       const a = c.face + (i - 1) * 0.14;
       S.projectiles.push({
@@ -463,6 +492,26 @@ const Sim = (() => {
     evt({ type: 'spinal', x: c.x, y: c.y, side: c.side });
     return true;
   }
+  // missile barrage: eight birds — half chase fighters, half slam the targeted subsystem
+  function fireMissiles(c) {
+    if (c.dead || c.subs.weapons.disabled || c.missCd > 0) return false;
+    c.missCd = 12;
+    const foes = S.fighters.filter(f => f.alive && f.side !== c.side && f.state !== 'docked');
+    for (let i = 0; i < 8; i++) {
+      const ft = foes.length ? foes[(i / 2 | 0) % foes.length] : null;
+      const a = c.face + (i - 3.5) * 0.24;
+      S.projectiles.push({
+        kind: 'miss', side: c.side, hp: 10,
+        x: c.x + Math.cos(a) * 130, y: c.y + Math.sin(a) * 130,
+        vx: Math.cos(a) * 200, vy: Math.sin(a) * 200,
+        spd: 340, turn: 3.2, dmg: 28, life: 8,
+        tFid: (i % 2 === 0 && ft) ? ft.id : 0, sub: c.targetSub
+      });
+    }
+    evt({ type: 'msl', x: c.x, y: c.y });
+    return true;
+  }
+
   function launchSquad(c, sq) {
     if (c.dead || c.subs.hangar.disabled || c.launchCd > 0) return false;
     let any = false;
@@ -511,11 +560,11 @@ const Sim = (() => {
     // face so P sits on our broadside (±90°)
     const flank = wrapA(toP - E.face) > 0 ? 1 : -1;
     const wantFace = toP - flank * Math.PI / 2;
-    const spd = 55 * pw(E, 'engines') * (E.subs.engines.disabled ? 0.18 : 1);
-    E.face += clamp(wrapA(wantFace - E.face), -0.5 * TICK, 0.5 * TICK);
+    const spd = 115 * pw(E, 'engines') * (E.subs.engines.disabled ? 0.18 : 1);
+    E.face += clamp(wrapA(wantFace - E.face), -0.85 * TICK, 0.85 * TICK);
     const push = d > want + 80 ? 1 : d < want - 80 ? -1 : 0;
-    E.vx += (Math.cos(toP) * push * spd - E.vx) * (1 - Math.exp(-0.5 * TICK));
-    E.vy += (Math.sin(toP) * push * spd - E.vy) * (1 - Math.exp(-0.5 * TICK));
+    E.vx += (Math.cos(toP) * push * spd - E.vx) * (1 - Math.exp(-0.85 * TICK));
+    E.vy += (Math.sin(toP) * push * spd - E.vy) * (1 - Math.exp(-0.85 * TICK));
     E.x += E.vx * TICK; E.y += E.vy * TICK;
 
     if (S.aiThinkT > 0) return;
@@ -531,6 +580,7 @@ const Sim = (() => {
     // capital fire
     fireBroadside(E);
     if (E.spinalCd <= 0 && R() < 0.6 * S.diff.aggro) fireSpinal(E);
+    if (E.missCd <= 0 && R() < 0.5 * S.diff.aggro) fireMissiles(E);
     // squadron management: launch what's ready, recall the dying
     for (let sq = 0; sq < 3; sq++) {
       const docked = S.fighters.filter(f => f.alive && f.side === 'E' && f.squad === sq && f.state === 'docked');
@@ -569,10 +619,10 @@ const Sim = (() => {
 
     // ---- player helm: weighty, momentum, no instant stops ----
     if (!P.dead) {
-      const spd = 55 * pw(P, 'engines') * (P.subs.engines.disabled ? 0.18 : 1);
-      P.face += (cmd.turn || 0) * 0.55 * pw(P, 'engines') * (P.subs.engines.disabled ? 0.3 : 1) * TICK;
+      const spd = 115 * pw(P, 'engines') * (P.subs.engines.disabled ? 0.18 : 1) * (P.wmg.charging ? 0.45 : 1);
+      P.face += (cmd.turn || 0) * 0.95 * pw(P, 'engines') * (P.subs.engines.disabled ? 0.3 : 1) * TICK;
       if (cmd.thrust) {
-        const k = 1 - Math.exp(-0.5 * TICK);
+        const k = 1 - Math.exp(-0.85 * TICK);
         P.vx += (Math.cos(P.face) * spd * cmd.thrust - P.vx) * k;
         P.vy += (Math.sin(P.face) * spd * cmd.thrust - P.vy) * k;
       } else { P.vx *= 1 - 0.15 * TICK; P.vy *= 1 - 0.15 * TICK; }
@@ -589,6 +639,36 @@ const Sim = (() => {
       if (cmd.order) orderSquad(P, S.sel, cmd.order);
       if (cmd.broadside) fireBroadside(P);
       if (cmd.spinal) fireSpinal(P);
+      if (cmd.missile) fireMissiles(P);
+      // WAVE MOTION GUN: hold [H] — the ship braces, energy gathers, judgment
+      const wm = P.wmg;
+      wm.cd = Math.max(0, wm.cd - TICK);
+      if (cmd.wmgHold && wm.cd <= 0 && !P.subs.weapons.disabled) {
+        if (!wm.charging) { wm.charging = true; wm.charge = 0; evt({ type: 'wmgcharge' }); }
+        wm.charge += TICK / 2.2;
+        if (wm.charge >= 1) {
+          wm.charging = false; wm.charge = 0; wm.cd = 45;
+          S.beamT = 0.7; S.beamN = 0;
+          evt({ type: 'wmgfire', x: P.x, y: P.y });
+        }
+      } else if (wm.charging) { wm.charging = false; wm.charge = 0; }
+    }
+    // beam pulses: everything in the corridor answers for its sins
+    if (S.beamT > 0) {
+      S.beamT -= TICK; S.beamN++;
+      const dx = Math.cos(P.face), dy = Math.sin(P.face);
+      const ox = P.x + dx * 250, oy = P.y + dy * 250;
+      const inCorr = (x, y, w2) => {
+        const rx = x - ox, ry = y - oy;
+        const along = rx * dx + ry * dy;
+        return along > 0 && along < 2600 && Math.abs(rx * dy - ry * dx) < w2;
+      };
+      for (const f of S.fighters)
+        if (f.alive && f.side === 'E' && f.state !== 'docked' && inCorr(f.x, f.y, 95)) killFighter(f);
+      for (const pr of S.projectiles)
+        if (pr.side === 'E' && inCorr(pr.x, pr.y, 95)) pr.dead = true;
+      if (S.beamN % 6 === 0 && !S.E.dead && inCorr(S.E.x, S.E.y, 95 + S.E.radius))
+        hitCarrier(S.E, 72, S.E.x, S.E.y, P.targetSub, true);
     }
 
     tickCarrier(P);
@@ -661,8 +741,8 @@ const Render = (() => {
     const x = c.getContext('2d');
     x.translate(L / 2, Wd / 2);
     const U = 1.1;                                // px per metre-ish
-    const main = side === 'P' ? ['#5d7a99', '#31435a', '#182230'] : ['#8c3a42', '#4a1e26', '#1c0c10'];
-    const trim = side === 'P' ? '#8fb2d4' : '#c25a55';
+    const main = side === 'P' ? ['#9aa4b2', '#6d7684', '#454d59'] : ['#8c3a42', '#4a1e26', '#1c0c10'];
+    const trim = side === 'P' ? '#b8c4d2' : '#c25a55';
     const HULL = [[230, 0], [180, 28], [95, 46], [-30, 58], [-140, 62], [-205, 44], [-228, 16],
                   [-228, -16], [-205, -44], [-140, -62], [-30, -58], [95, -46], [180, -28]];
     const poly = pts => { x.beginPath(); pts.forEach((p, i) => i ? x.lineTo(p[0] * U, p[1] * U) : x.moveTo(p[0] * U, p[1] * U)); x.closePath(); };
@@ -705,6 +785,38 @@ const Render = (() => {
     // conning tower
     x.fillStyle = main[0]; x.fillRect(-10 * U, -14 * U, 40 * U, 28 * U);
     x.fillStyle = trim; x.fillRect(2 * U, -6 * U, 16 * U, 12 * U);
+    if (side === 'P') {
+      // ---- the Yamato treatment: red flanks, wave-gun muzzle, pagoda, turrets ----
+      x.fillStyle = '#8c2f28';
+      poly([[180, 28], [95, 46], [-30, 58], [-140, 62], [-205, 44], [-205, 34], [-140, 50], [-30, 46], [95, 36], [180, 20]]);
+      x.fill();
+      poly([[180, -28], [95, -46], [-30, -58], [-140, -62], [-205, -44], [-205, -34], [-140, -50], [-30, -46], [95, -36], [180, -20]]);
+      x.fill();
+      // red bow chevron
+      x.fillStyle = '#c04038';
+      poly([[229, 0], [196, 9], [196, -9]]); x.fill();
+      // wave motion gun muzzle
+      x.fillStyle = '#10151c';
+      x.beginPath(); x.arc(206 * U, 0, 9, 0, TAU); x.fill();
+      x.strokeStyle = '#7d93ad'; x.lineWidth = 2; x.stroke();
+      x.fillStyle = '#6fd8ff';
+      x.beginPath(); x.arc(206 * U, 0, 3.5, 0, TAU); x.fill();
+      // triple-barrel turrets down the spine
+      const turret = (tx0, dir) => {
+        x.strokeStyle = '#39424e'; x.lineWidth = 3;
+        x.beginPath();
+        for (const off of [-5, 0, 5]) { x.moveTo(tx0 * U + dir * 6, off); x.lineTo(tx0 * U + dir * 26, off); }
+        x.stroke();
+        x.fillStyle = '#525c6b';
+        x.beginPath(); x.arc(tx0 * U, 0, 10, 0, TAU); x.fill();
+        x.strokeStyle = '#2c333d'; x.lineWidth = 1.6; x.stroke();
+      };
+      turret(160, 1); turret(115, 1); turret(-165, -1);
+      // pagoda bridge
+      x.fillStyle = '#454e5c'; x.fillRect(-24 * U, -12 * U, 52 * U, 24 * U);
+      x.fillStyle = '#5a6472'; x.fillRect(-14 * U, -8 * U, 34 * U, 16 * U);
+      x.fillStyle = '#8b97a8'; x.beginPath(); x.arc(2 * U, 0, 6, 0, TAU); x.fill();
+    }
     return c;
   }
   const HULLS = { P: buildCarrier('P'), E: buildCarrier('E') };
@@ -738,6 +850,8 @@ const Render = (() => {
         case 'pew': flashes.push({ x: e.x, y: e.y, r: 9, life: 0.05, max: 0.05, img: e.side === 'P' ? GLOW.blue : GLOW.red }); break;
         case 'broadside': flashes.push({ x: e.x, y: e.y, r: 42, life: 0.14, max: 0.14, img: GLOW.gold }); shake = Math.min(26, shake + 3); break;
         case 'spinal': flashes.push({ x: e.x, y: e.y, r: 120, life: 0.3, max: 0.3, img: GLOW.teal }); shake = Math.min(26, shake + 10); break;
+        case 'msl': flashes.push({ x: e.x, y: e.y, r: 60, life: 0.15, max: 0.15, img: GLOW.blue }); break;
+        case 'wmgfire': flashes.push({ x: e.x, y: e.y, r: 300, life: 0.3, max: 0.3, img: GLOW.white }); shake = Math.min(26, shake + 22); break;
         case 'subdown': boom(e.x || 0, e.y || 0, 20, false); if (e.side === 'P') redF = 0.5; break;
         case 'carrierdeath': boom(e.c.x, e.c.y, 60, true); boom(e.c.x + 80, e.c.y + 40, 40, true); boom(e.c.x - 90, e.c.y - 30, 40, true); break;
         case 'fighterdown': if (e.side === 'P') redF = Math.min(0.5, redF + 0.18); break;
@@ -857,10 +971,26 @@ const Render = (() => {
     sctx.font = 'bold 9px Consolas,monospace';
     sctx.fillStyle = P.broadCd <= 0 && canB ? '#8fe0a8' : '#7d93a8';
     sctx.fillText('[LMB] BROADSIDE ' + (P.subs.weapons.disabled ? 'OFFLINE' : canB ? (P.broadCd <= 0 ? 'READY' : P.broadCd.toFixed(1)) : 'NO ARC — show your flank'), bx + 8, by + 152);
-    // ===== spinal + target (bottom-center) =====
+    // ===== the arsenal (bottom-center): every trigger aims at [TAB] target =====
     sctx.textAlign = 'center';
-    sctx.fillStyle = P.spinalCd <= 0 ? '#7fe0d8' : '#7d93a8';
-    sctx.fillText('[SPACE] SPINAL TORPEDOES ' + (P.spinalCd <= 0 ? 'READY' : Math.ceil(P.spinalCd) + 's') + '  →  ' + Sim.SUBS[P.targetSub].label + '  ([TAB] retarget)', W / 2, H - 10);
+    const wmgP = P.wmg;
+    const wmgTxt = P.subs.weapons.disabled ? 'OFFLINE'
+      : wmgP.charging ? 'CHARGING ' + Math.round(wmgP.charge * 100) + '%'
+      : wmgP.cd > 0 ? Math.ceil(wmgP.cd) + 's' : 'READY';
+    sctx.fillStyle = wmgP.charging ? '#bfe9ff' : wmgP.cd <= 0 ? '#8fe0a8' : '#7d93a8';
+    sctx.font = 'bold 10px Consolas,monospace';
+    sctx.fillText('[hold H] WAVE MOTION GUN ' + wmgTxt + '   ·   [T/RMB] MISSILES '
+      + (P.missCd <= 0 ? 'READY' : Math.ceil(P.missCd) + 's') + '   ·   [SPACE] SPINAL '
+      + (P.spinalCd <= 0 ? 'READY' : Math.ceil(P.spinalCd) + 's'), W / 2, H - 24);
+    sctx.fillStyle = '#7fe0d8';
+    sctx.fillText('target →  ' + Sim.SUBS[P.targetSub].label + '   ([TAB] or click the enemy panel to retarget)', W / 2, H - 10);
+    if (wmgP.charging) {
+      sctx.save();
+      sctx.shadowColor = 'rgba(140,220,255,0.9)'; sctx.shadowBlur = 20;
+      sctx.fillStyle = '#dff4ff'; sctx.font = 'bold 22px Consolas,monospace';
+      sctx.fillText('WAVE MOTION GUN — ' + Math.round(wmgP.charge * 100) + '%', W / 2, H * 0.28);
+      sctx.restore();
+    }
 
     // ===== enemy ship (bottom-right) =====
     const ex = W - 264, ey = H - 128, ew = 250;
@@ -972,11 +1102,12 @@ const Render = (() => {
       sctx.fillStyle = '#8fa4b8'; sctx.font = '14px Consolas,monospace';
       sctx.fillText('two carriers · a hundred sparks between them · bring your wings home', W / 2, H * 0.24 + 30);
       const lines = [
-        ['HELM', 'W/S thrust · A/D turn — 60,000 tonnes of momentum'],
-        ['CAPITAL GUNS', 'LMB broadside (show your FLANK) · SPACE spinal torpedoes at [TAB] subsystem'],
+        ['HELM', 'W/S thrust · A/D turn — she is fast for a leviathan. Use it.'],
+        ['ARSENAL', 'LMB broadside (show your FLANK) · T/RMB missile barrage · SPACE spinal torps'],
+        ['WMG', 'hold H — bow-on, 2 seconds of courage, then the WAVE MOTION GUN erases the lane'],
         ['WINGS', '1-3 select · 4 all · L launch · Q intercept · E strike · F defend · G regroup'],
         ['THE SOUL', 'R = RECALL. Wounded fighters that dock are REPAIRED and fly again. Dead ones are gone.'],
-        ['POWER', 'Z weapons · X balanced · C shields · V hangar — the budget is the battle'],
+        ['POWER', 'Z weapons · X balanced · C shields · V hangar · [TAB] picks the subsystem everything hits'],
         ['', 'protect your HANGAR. kill theirs.']
       ];
       let yy = H * 0.4;
@@ -1051,6 +1182,37 @@ const Render = (() => {
 
     drawCarrier(S, P, now); drawCarrier(S, E, now);
 
+    // ---- wave motion gun: charge at the bow, then the lance ----
+    if (P.wmg && P.wmg.charging) {
+      const bx = w2x(P.x + Math.cos(P.face) * 250), by = w2y(P.y + Math.sin(P.face) * 250);
+      g.globalCompositeOperation = 'lighter';
+      glow(bx, by, (12 + 60 * P.wmg.charge) * (1 + 0.15 * Math.sin(now * 40)), GLOW.blue, 0.3 + 0.7 * P.wmg.charge);
+      glow(bx, by, 8 + 22 * P.wmg.charge, GLOW.white, P.wmg.charge);
+      g.strokeStyle = `rgba(120,215,255,${(0.15 + 0.3 * P.wmg.charge).toFixed(2)})`;
+      g.setLineDash([10, 14]); g.lineWidth = 2;
+      g.beginPath(); g.moveTo(bx, by);
+      g.lineTo(bx + Math.cos(P.face) * 2600 * scale, by + Math.sin(P.face) * 2600 * scale);
+      g.stroke(); g.setLineDash([]);
+      g.globalCompositeOperation = 'source-over';
+    }
+    if (S.beamT > 0) {
+      g.globalCompositeOperation = 'lighter';
+      const env = Math.min(1, (0.7 - S.beamT) * 10 + 0.2, S.beamT * 3);
+      const x1 = w2x(P.x + Math.cos(P.face) * 250), y1 = w2y(P.y + Math.sin(P.face) * 250);
+      const dxb = Math.cos(P.face), dyb = Math.sin(P.face);
+      const x2 = x1 + dxb * 2600 * scale, y2 = y1 + dyb * 2600 * scale;
+      for (const [w2, col] of [[190, `rgba(90,170,255,${(0.2 * env).toFixed(2)})`],
+                               [90, `rgba(150,215,255,${(0.45 * env).toFixed(2)})`],
+                               [34, `rgba(230,248,255,${(0.9 * env).toFixed(2)})`]]) {
+        g.strokeStyle = col; g.lineWidth = Math.max(1, w2 * scale);
+        g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+      }
+      glow(x1, y1, 180 * scale * env + 30, GLOW.blue, env);
+      glow(x1, y1, 70 * scale * env + 14, GLOW.white, env);
+      g.lineWidth = 1; g.globalCompositeOperation = 'source-over';
+      shake = Math.min(24, shake + 30 * dt);
+    }
+
     // projectiles
     g.globalCompositeOperation = 'lighter';
     for (const pr of S.projectiles) {
@@ -1059,6 +1221,10 @@ const Render = (() => {
         glow(x, y, 16, pr.side === 'P' ? GLOW.teal : GLOW.orange, 0.9);
         g.fillStyle = '#fff'; g.beginPath(); g.arc(x, y, 2.5, 0, TAU); g.fill();
         if (Math.random() < 0.5) parts.push({ x: pr.x, y: pr.y, vx: 0, vy: 0, life: 0.4, max: 0.4, k: 'smoke', sz: 3 });
+      } else if (pr.kind === 'miss') {
+        glow(x, y, 9, pr.side === 'P' ? GLOW.blue : GLOW.red, 0.85);
+        g.fillStyle = '#fff'; g.beginPath(); g.arc(x, y, 1.6, 0, TAU); g.fill();
+        if (Math.random() < 0.35) parts.push({ x: pr.x, y: pr.y, vx: 0, vy: 0, life: 0.3, max: 0.3, k: 'smoke', sz: 2 });
       } else {
         const L2 = pr.kind === 'shell' ? 0.03 : 0.014;
         g.strokeStyle = pr.side === 'P'
@@ -1215,6 +1381,9 @@ const Audio2 = (() => {
         case 'pd': if (Math.random() < 0.35) blip(1400, 0.03, 'square', 0.014, 700, pan); break;
         case 'broadside': cannon(pan); break;
         case 'spinal': blip(90, 0.5, 'sine', 0.3, 26, pan); noise(0.45, 0.2, 500, 60, pan); break;
+        case 'msl': noise(0.5, 0.16, 600, 3000, pan); blip(340, 0.3, 'triangle', 0.06, 900, pan); break;
+        case 'wmgcharge': blip(70, 2.2, 'sawtooth', 0.08, 950); break;
+        case 'wmgfire': noise(2.2, 0.55, 1400, 40); blip(30, 2.6, 'sine', 0.45, 16); blip(220, 1.2, 'sawtooth', 0.12, 30); break;
         case 'boom': noise(e.big ? 1.6 : 0.5, e.big ? 0.5 : 0.22, 900, 45, pan); if (e.big) blip(60, 1.2, 'sine', 0.3, 24, pan); break;
         case 'shield': blip(900, 0.08, 'triangle', 0.05, 500, pan); break;
         case 'armorhit': noise(0.1, 0.06, 900, 200, pan); break;
@@ -1243,7 +1412,7 @@ const Audio2 = (() => {
 const Input = (() => {
   const held = new Set();
   let launch = false, order = null, sel = null, cycleSub = false, preset = null,
-      broadside = false, spinal = false, pause = false, restart = false, start = null,
+      broadside = false, spinal = false, missile = false, pause = false, restart = false, start = null,
       setSub = null;
   window.addEventListener('keydown', e => {
     Audio2.ensure();
@@ -1268,17 +1437,20 @@ const Input = (() => {
     if (k === 'c') preset = 'shields';
     if (k === 'v') preset = 'hangar';
     if (k === ' ') spinal = true;
+    if (k === 't') missile = true;
     if (k === 'p') pause = true;
     if (k === 'enter') restart = true;
   });
   window.addEventListener('keyup', e => held.delete(e.key.toLowerCase()));
   window.addEventListener('blur', () => held.clear());
   const cvEl = document.getElementById('cv');
+  cvEl.addEventListener('contextmenu', e => e.preventDefault());
   cvEl.addEventListener('pointerdown', e => {
     Audio2.ensure();
     const S = Sim.state();
     if (S.mode === 'title') { start = 1; return; }
     if (S.mode === 'end') { restart = true; return; }
+    if (e.button === 2) { missile = true; return; }   // right-click: missile barrage
     const r = cvEl.getBoundingClientRect();
     const x = e.clientX - r.left, y = e.clientY - r.top;
     const sub = Render.subHit(x, y);
@@ -1292,10 +1464,10 @@ const Input = (() => {
       thrust: (held.has('w') ? 1 : 0) + (held.has('s') ? -0.6 : 0),
       turn: (held.has('a') ? -1 : 0) + (held.has('d') ? 1 : 0),
       launch, order, sel, cycleSub, setSub, preset,
-      broadside: broadside || held.has(' ') && false, spinal, pause, restart, start
+      broadside, spinal, missile, wmgHold: held.has('h'), pause, restart, start
     };
     launch = false; order = null; sel = null; cycleSub = false; setSub = null;
-    preset = null; broadside = false; spinal = false; pause = false; restart = false; start = null;
+    preset = null; broadside = false; spinal = false; missile = false; pause = false; restart = false; start = null;
     return cmd;
   }
   return { consume };
