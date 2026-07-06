@@ -14,7 +14,7 @@
 <script>
 "use strict";
 /* =====================================================================
-   LEVIATHANS — a capital-class carrier duel  [build v2.3-proper-battle]
+   LEVIATHANS — a capital-class carrier duel  [build v2.4-yamato-title]
    (companion piece to STAR BLAZERS: Carbon Skirmish — same DNA:
     a fixed-tick simulation that owns all state, a renderer that only
     reads it, and WebAudio synthesis for every sound. One file, no deps.)
@@ -1242,21 +1242,76 @@ const Render = (() => {
   function overlay(S) {
     sctx.textAlign = 'center';
     if (S.mode === 'title') {
-      sctx.fillStyle = 'rgba(2,4,9,0.6)'; sctx.fillRect(0, 0, W, H);
+      const tt = performance.now() / 1000;
+      sctx.fillStyle = 'rgba(2,4,9,0.78)'; sctx.fillRect(0, 0, W, H);
+      // hyperspace star streaks drifting past
+      sctx.save();
+      for (let i = 0; i < 34; i++) {
+        const sy2 = (i * 89.7) % H;
+        const sx2 = ((i * 137.5 + tt * (14 + (i % 5) * 7)) % (W + 120)) - 60;
+        const len = 26 + (i % 4) * 16;
+        sctx.strokeStyle = i % 6 ? 'rgba(160,200,255,' + (0.06 + (i % 3) * 0.05) + ')'
+                                  : 'rgba(255,150,110,0.12)';
+        sctx.lineWidth = i % 7 ? 1 : 1.6;
+        sctx.beginPath(); sctx.moveTo(sx2, sy2); sctx.lineTo(sx2 - len, sy2 + len * 0.18); sctx.stroke();
+      }
+      sctx.restore();
+      // the red planet rising at the foot of the screen
+      const pcx = W / 2, pcy = H + W * 0.5, prad = W * 0.62;
+      const pg = sctx.createRadialGradient(pcx, pcy, prad * 0.55, pcx, pcy, prad);
+      pg.addColorStop(0, '#1a0505'); pg.addColorStop(0.82, '#4a120c');
+      pg.addColorStop(0.96, '#a03422'); pg.addColorStop(1, '#ff6a40');
+      sctx.fillStyle = pg;
+      sctx.beginPath(); sctx.arc(pcx, pcy, prad, 0, TAU); sctx.fill();
+      sctx.save();                                   // hot rim of atmosphere
+      sctx.globalCompositeOperation = 'lighter';
+      sctx.strokeStyle = 'rgba(255,120,70,0.5)'; sctx.lineWidth = 3;
+      sctx.beginPath(); sctx.arc(pcx, pcy, prad + 2, 0, TAU); sctx.stroke();
+      sctx.strokeStyle = 'rgba(255,190,140,0.16)'; sctx.lineWidth = 14;
+      sctx.beginPath(); sctx.arc(pcx, pcy, prad + 8, 0, TAU); sctx.stroke();
+      sctx.restore();
+      // the flagship cruises above the title, engines burning
+      sctx.save();
+      const shipW = Math.min(430, W * 0.44), shipH = shipW * 230 / 560;
+      const shx = W / 2 + Math.sin(tt * 0.22) * 16, shy = H * 0.125 + Math.sin(tt * 0.5) * 5;
+      sctx.translate(shx, shy); sctx.rotate(-0.055);
+      sctx.globalCompositeOperation = 'lighter';     // exhaust wake first
+      const eg = sctx.createLinearGradient(-shipW * 0.5, 0, -shipW * 0.95, 0);
+      eg.addColorStop(0, 'rgba(130,205,255,0.5)'); eg.addColorStop(1, 'rgba(130,205,255,0)');
+      sctx.fillStyle = eg;
+      sctx.fillRect(-shipW * 0.95, -shipH * 0.06, shipW * 0.45, shipH * 0.12);
+      sctx.globalCompositeOperation = 'source-over';
+      sctx.shadowColor = 'rgba(90,160,240,0.55)'; sctx.shadowBlur = 24;
+      sctx.drawImage(HULLS.P, -shipW / 2, -shipH / 2, shipW, shipH);
+      sctx.restore();
+      // title + the Star Blazers red swoosh
       sctx.save();
       sctx.shadowColor = 'rgba(120,190,255,0.9)'; sctx.shadowBlur = 30;
       sctx.fillStyle = '#eaf2fa'; sctx.font = '900 60px Impact,"Arial Black",sans-serif';
-      sctx.fillText('L E V I A T H A N S', W / 2, H * 0.24);
+      sctx.fillText('L E V I A T H A N S', W / 2, H * 0.27);
       sctx.restore();
-      sctx.fillStyle = '#8fa4b8'; sctx.font = '14px Consolas,monospace';
-      sctx.fillText('two carriers · a hundred sparks between them · bring your wings home', W / 2, H * 0.24 + 30);
+      sctx.save();
+      sctx.shadowColor = 'rgba(255,80,50,0.9)'; sctx.shadowBlur = 14;
+      sctx.strokeStyle = '#e0402f'; sctx.lineWidth = 5; sctx.lineCap = 'round';
+      sctx.beginPath();
+      sctx.moveTo(W / 2 - 265, H * 0.27 + 16);
+      sctx.quadraticCurveTo(W / 2, H * 0.27 + 34, W / 2 + 265, H * 0.27 + 6);
+      sctx.stroke();
+      sctx.strokeStyle = '#ffd070'; sctx.lineWidth = 1.6;
+      sctx.beginPath();
+      sctx.moveTo(W / 2 - 235, H * 0.27 + 23);
+      sctx.quadraticCurveTo(W / 2, H * 0.27 + 39, W / 2 + 245, H * 0.27 + 13);
+      sctx.stroke();
+      sctx.restore();
+      sctx.fillStyle = '#ffb894'; sctx.font = 'italic 14px Georgia,serif';
+      sctx.fillText('a space battleship saga — two leviathans, a hundred sparks between them', W / 2, H * 0.27 + 54);
       const lines = [
         ['HELM', 'W/S thrust · A/D turn — she is fast for a leviathan. Use it.'],
         ['ARSENAL', 'LMB broadside (show your FLANK) · T/RMB missile barrage · SPACE spinal torps'],
         ['WMG', 'hold H — bow-on, 2 seconds of courage, then the WAVE MOTION GUN erases the lane'],
         ['WINGS', '1-3 select · 4 all · L launch · Q intercept · E strike · F defend · G regroup'],
         ['THE SOUL', 'R = RECALL. Wounded fighters that dock are REPAIRED and fly again. Dead ones are gone.'],
-        ['POWER', 'Z weapons · X balanced · C shields · V hangar · [TAB] picks the subsystem everything hits'],
+        ['POWER', 'Z weapons · X balanced · C shields · V hangar · [TAB] = target subsystem'],
         ['', 'protect your HANGAR. kill theirs.']
       ];
       let yy = H * 0.4;
