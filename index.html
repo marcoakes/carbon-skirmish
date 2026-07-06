@@ -6,7 +6,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   html,body{margin:0;padding:0;background:#020409;overflow:hidden;height:100%}
-  canvas{display:block;width:100vw;height:100vh;cursor:crosshair}
+  canvas{display:block;width:100vw;height:100vh;cursor:crosshair;touch-action:none}
 </style>
 </head>
 <body>
@@ -14,8 +14,10 @@
 <script>
 "use strict";
 /* =====================================================================
-   STAR BLAZERS — CARBON SKIRMISH v9
+   STAR BLAZERS — CARBON SKIRMISH v10
    (an unofficial fan tribute to Star Blazers / Space Battleship Yamato)
+   Now with live traversing turrets, two-echelon waves, full 360° helm
+   control, and touch controls for mobile.
    A structural homage to CCP's open-sourced Carbon engine.
    You fly a space battleship in the spirit of the Yamato — complete
    with a Wave Motion Gun — and you are the FC of a five-ship wing.
@@ -56,7 +58,7 @@ const Destiny = (() => {
   /* metres, m/s, seconds. track = turret tracking in rad/s: your hit
      chance collapses as the target's angular velocity beats it. */
   const CLS = {
-    player:  { radius: 13, speed: 240, abSpeed: 430, inertia: 2.2, turnRate: 2.4,
+    player:  { radius: 13, speed: 240, abSpeed: 430, inertia: 2.2, turnRate: 3.0,
                shield: 330, sregen: 8, armor: 300, hull: 260,
                cap: 130, cregen: 8.5, abDrain: 15,
                gunDmg: 12, gunRof: 0.4, gunRange: 520, gunCost: 3,
@@ -98,16 +100,22 @@ const Destiny = (() => {
                lock: 4.5, label: 'Sanguine Vesper' }
   };
 
+  /* waves arrive in two echelons: the opening group, then reinforcements
+     that drop out of warp from one bearing once the first group is bleeding.
+     ring waves surround you; assault waves come from a single direction. */
   const WAVES = [
-    { banner: 'WAVE 1 — SCOUT PICKET',
+    { banner: 'WAVE 1 — SCOUT PICKET', ring: true,
       sub: 'Call targets — your fleet shoots what you lock.',
-      ships: [['scout'], ['scout'], ['scout'], ['scout']] },
-    { banner: 'WAVE 2 — FRIGATE RESPONSE',
+      ships: [['scout'], ['scout'], ['scout']],
+      echelon: [['scout'], ['scout']] },
+    { banner: 'WAVE 2 — FRIGATE ASSAULT', ring: false,
       sub: 'They brought a Mender. Kill the logistics FIRST.',
-      ships: [['frigate'], ['frigate'], ['frigate'], ['scout'], ['scout'], ['hlogi']] },
-    { banner: 'WAVE 3 — THE SANGUINE VESPER',
-      sub: 'A Mender is keeping her alive. Primary the logi, then get under her guns.',
-      ships: [['cruiser', 'Sanguine Vesper'], ['escort'], ['escort'], ['hlogi'], ['scout'], ['scout']] }
+      ships: [['frigate'], ['frigate'], ['scout'], ['scout']],
+      echelon: [['frigate'], ['hlogi'], ['scout']] },
+    { banner: 'WAVE 3 — THE SANGUINE VESPER', ring: false,
+      sub: 'Primary her Mender when it lands, then get under her guns.',
+      ships: [['cruiser', 'Sanguine Vesper'], ['escort'], ['escort']],
+      echelon: [['hlogi'], ['scout'], ['scout']] }
   ];
 
   const FLEET = [['tackle', 'Talon'], ['tackle', 'Grip'], ['dps', 'Hammer'], ['dps', 'Anvil'], ['logi', 'Mercy']];
@@ -144,6 +152,7 @@ const Destiny = (() => {
       msl: cls === 'player' ? 6 : 0, mslCd: 0,
       bossPhase: 0, lance: null, lanceCd: 0, lanceTick: 0,
       wing: false, aimId: null, aimT: 0, webbedT: 0, repTargetId: null, webbingId: null,
+      batTargetId: null,
       orbitDir: rng() < 0.5 ? 1 : -1, muzzle: 1,
       alive: true, wreck: false, wreckT: 0, spin: 0
     };
@@ -166,19 +175,20 @@ const Destiny = (() => {
       overtime: false, otWave: 0, otCleared: 0, waveHullStart: 260,
       fleetOrder: 'focus', fleetLost: [], waveWingLost: false,
       mods: {}, draft: null, killsBy: {}, heatOn: false, heatUsed: false, wmgCdMax: 45,
+      echelon: null, echelonAt: 0,
       stats: { shots: 0, hits: 0, endT: 0 }
     };
     S.player = makeShip('player', 'Your Ship', 0, 0);
     S.ships.push(S.player);
   }
 
-  function spawnWave(i) {
-    const w = WAVES[i];
-    S.waveStartT = S.t;
+  function spawnGroup(list, ring) {
     const baseAng = rr(0, TAU);
-    w.ships.forEach((spec, k) => {
-      const ang = baseAng + k * (TAU / w.ships.length) + rr(-0.35, 0.35);
-      const dist = rr(1050, 1400);
+    list.forEach((spec, k) => {
+      const ang = ring
+        ? baseAng + k * (TAU / list.length) + rr(-0.35, 0.35)
+        : baseAng + rr(-0.45, 0.45);
+      const dist = rr(1050, 1450);
       const sh = makeShip(spec[0], spec[1],
         S.player.x + Math.cos(ang) * dist,
         S.player.y + Math.sin(ang) * dist);
@@ -187,6 +197,14 @@ const Destiny = (() => {
       S.ships.push(sh);
       S.events.push({ type: 'warpin', x: sh.x, y: sh.y, ang: ang + Math.PI, big: spec[0] === 'cruiser' });
     });
+  }
+
+  function spawnWave(i) {
+    const w = WAVES[i];
+    S.waveStartT = S.t;
+    spawnGroup(w.ships, w.ring);
+    S.echelon = w.echelon || null;
+    S.echelonAt = Math.max(1, Math.ceil(w.ships.length / 2));
     S.events.push({ type: 'banner', text: w.banner, sub: w.sub });
   }
 
@@ -357,14 +375,15 @@ const Destiny = (() => {
     return { hit: rng() < chance, chance };
   }
 
-  function fire(sh, target, dmg, speed, range, track) {
+  function fire(sh, target, dmg, speed, range, track, ox, oy) {
     const roll = rollHit(sh, target, track);
-    let ang = interceptAngle(sh.x, sh.y, target, speed);
+    const fx = ox != null ? ox : sh.x, fy = oy != null ? oy : sh.y;
+    let ang = interceptAngle(fx, fy, target, speed);
     if (!roll.hit) ang += rr(0.05, 0.13) * (rng() < 0.5 ? 1 : -1);
     else ang += rr(-0.012, 0.012);
-    const mx = sh.x + Math.cos(ang) * (sh.radius + 5);
-    const my = sh.y + Math.sin(ang) * (sh.radius + 5);
-    const dist = Math.hypot(target.x - sh.x, target.y - sh.y);
+    const mx = ox != null ? fx : sh.x + Math.cos(ang) * (sh.radius + 5);
+    const my = oy != null ? fy : sh.y + Math.sin(ang) * (sh.radius + 5);
+    const dist = Math.hypot(target.x - fx, target.y - fy);
     S.projectiles.push({
       kind: 'shot',
       x: mx, y: my, px: mx, py: my,
@@ -511,10 +530,13 @@ const Destiny = (() => {
       const k = 1 - Math.exp(-0.4 * TICK);
       p.vx -= p.vx * k; p.vy -= p.vy * k;
     }
-    // a battleship swings her bow with real inertia
-    if (Math.hypot(p.vx, p.vy) > 8) {
-      const want = Math.atan2(p.vy, p.vx);
-      let diff = want - p.face;
+    // a battleship swings her bow with real inertia — the bow follows
+    // your thrust keys (full 360°, even at rest); velocity catches up
+    let wantFace = null;
+    if (il > 0) wantFace = Math.atan2(iy, ix);
+    else if (Math.hypot(p.vx, p.vy) > 8) wantFace = Math.atan2(p.vy, p.vx);
+    if (wantFace !== null) {
+      let diff = wantFace - p.face;
       while (diff > Math.PI) diff -= TAU;
       while (diff < -Math.PI) diff += TAU;
       p.face += clamp(diff, -d.turnRate * TICK, d.turnRate * TICK);
@@ -539,26 +561,55 @@ const Destiny = (() => {
       }
     }
 
-    const tgt = S.ships.find(s => s.id === S.lockTargetId && s.alive);
-    if (!tgt) { S.lockTargetId = null; S.locked = false; S.lockProgress = 0; }
+    let tgt = S.ships.find(s => s.id === S.lockTargetId && s.alive);
+    if (!tgt) {
+      S.lockTargetId = null; S.locked = false; S.lockProgress = 0;
+      // auto-call the next target so the fleet never sits idle
+      const hs2 = hostiles();
+      if (hs2.length) {
+        let best2 = null, bd3 = Infinity;
+        for (const h of hs2) {
+          const dd = Math.hypot(h.x - p.x, h.y - p.y);
+          if (dd < bd3) { bd3 = dd; best2 = h; }
+        }
+        setLockTarget(best2.id);
+        tgt = best2;
+      }
+    }
     else if (!S.locked) {
       S.lockProgress += TICK;
       if (S.lockProgress >= S.lockNeed) { S.locked = true; S.events.push({ type: 'lock' }); }
     }
 
-    // turrets
+    // main battery: your locked target first — or anything inside 420 m,
+    // because a battleship's turrets do not politely ignore boarders
     p.gunCd -= TICK;
-    if (S.locked && tgt && p.gunCd <= 0) {
-      const dist = Math.hypot(tgt.x - p.x, tgt.y - p.y);
-      if (dist <= d.gunRange) {
-        if (p.cap >= d.gunCost) {
-          p.cap -= d.gunCost;
-          fire(p, tgt, d.gunDmg * (1 + 0.15 * modN('gun')) * rr(0.85, 1.15),
-            d.pspeed, d.gunRange + 200, d.track * (1 + 0.25 * modN('track')));
-          p.gunCd = d.gunRof / (S.heatOn ? 1.5 : 1);
-          p.muzzle = -p.muzzle;
-        } else { S.capEmptyFlash = 1.2; p.gunCd = 0.3; }
+    let batTgt = (S.locked && tgt && Math.hypot(tgt.x - p.x, tgt.y - p.y) <= d.gunRange) ? tgt : null;
+    if (!batTgt) {
+      let bd4 = 420;
+      for (const h of hostiles()) {
+        const dd = Math.hypot(h.x - p.x, h.y - p.y);
+        if (dd < bd4) { bd4 = dd; batTgt = h; }
       }
+    }
+    p.batTargetId = batTgt ? batTgt.id : null;
+    if (batTgt && p.gunCd <= 0) {
+      if (p.cap >= d.gunCost) {
+        p.cap -= d.gunCost;
+        // the shot comes from whichever turret bears on the target
+        const ta = Math.atan2(batTgt.y - p.y, batTgt.x - p.x);
+        let rel = ta - p.face;
+        while (rel > Math.PI) rel -= TAU;
+        while (rel < -Math.PI) rel += TAU;
+        let ti;
+        if (Math.abs(rel) > 2.0) ti = 2;
+        else { p.muzzle = -p.muzzle; ti = p.muzzle > 0 ? 0 : 1; }
+        const slotX = [1.16, 0.64, -1.08][ti] * p.radius * 2.2;
+        fire(p, batTgt, d.gunDmg * (1 + 0.15 * modN('gun')) * rr(0.85, 1.15),
+          d.pspeed, d.gunRange + 200, d.track * (1 + 0.25 * modN('track')),
+          p.x + Math.cos(p.face) * slotX, p.y + Math.sin(p.face) * slotX);
+        p.gunCd = d.gunRof / (S.heatOn ? 1.5 : 1);
+      } else { S.capEmptyFlash = 1.2; p.gunCd = 0.3; }
     }
 
     // missiles: fire-and-forget at the locked target
@@ -859,7 +910,24 @@ const Destiny = (() => {
   }
 
   function tickWaves() {
-    if (hostiles().length !== 0) return;
+    const hn = hostiles().length;
+    if (hn !== 0) {
+      // second echelon drops in once the opening group is bleeding
+      if (S.echelon && hn <= S.echelonAt) {
+        spawnGroup(S.echelon, false);
+        S.echelon = null;
+        S.events.push({ type: 'banner', text: 'REINFORCEMENTS ON GRID',
+          sub: 'Second echelon just dropped out of warp' });
+      }
+      return;
+    }
+    if (S.echelon) {   // opening group already dead — the echelon lands NOW
+      spawnGroup(S.echelon, false);
+      S.echelon = null;
+      S.events.push({ type: 'banner', text: 'REINFORCEMENTS ON GRID',
+        sub: 'Second echelon just dropped out of warp' });
+      return;
+    }
     if (!S.overtime && S.wave >= WAVES.length) {
       if (S.mode === 'play') {
         S.mode = 'victory'; S.stats.endT = S.t;
@@ -1232,22 +1300,13 @@ const Trinity = (() => {
       x.strokeStyle = '#7d93ad'; x.lineWidth = U * 0.03; x.stroke();
       x.fillStyle = '#6fd8ff';
       x.beginPath(); x.arc(1.7 * U, 0, 0.05 * U, 0, TAU); x.fill();
-      // triple-barrel turrets (two fore, one aft)
-      const turret = (tx0, dir) => {
-        x.strokeStyle = '#39424e'; x.lineWidth = U * 0.045;
-        x.beginPath();
-        for (const off of [-0.08, 0, 0.08]) {
-          x.moveTo((tx0 + dir * 0.08) * U, off * U);
-          x.lineTo((tx0 + dir * 0.5) * U, off * U);
-        }
-        x.stroke();
-        x.fillStyle = '#525c6b';
-        x.beginPath(); x.arc(tx0 * U, 0, 0.17 * U, 0, TAU); x.fill();
-        x.strokeStyle = '#2c333d'; x.lineWidth = U * 0.028; x.stroke();
-        x.fillStyle = '#6b7686';
-        x.beginPath(); x.arc((tx0 - dir * 0.03) * U, -0.03 * U, 0.09 * U, 0, TAU); x.fill();
-      };
-      turret(1.16, 1); turret(0.64, 1); turret(-1.08, -1);
+      // turret barbettes — the live turrets are drawn in-world so they traverse
+      for (const bx of [1.16, 0.64, -1.08]) {
+        x.fillStyle = '#2c333d';
+        x.beginPath(); x.arc(bx * U, 0, 0.2 * U, 0, TAU); x.fill();
+        x.fillStyle = '#39424e';
+        x.beginPath(); x.arc(bx * U, 0, 0.16 * U, 0, TAU); x.fill();
+      }
       // pagoda bridge superstructure
       x.fillStyle = '#454e5c'; x.fillRect(-0.55 * U, -0.16 * U, 0.75 * U, 0.32 * U);
       x.fillStyle = '#5a6472'; x.fillRect(-0.42 * U, -0.11 * U, 0.5 * U, 0.22 * U);
@@ -1390,6 +1449,32 @@ const Trinity = (() => {
     logi: shipSprite('logi', 30),
     hlogi: shipSprite('hlogi', 29)
   };
+  // the main battery: a pre-rendered triple-barrel turret, drawn live per slot
+  const TURRET_SPR = (() => {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const x = c.getContext('2d');
+    x.translate(32, 32);
+    x.strokeStyle = '#39424e'; x.lineWidth = 4.5;
+    x.beginPath();
+    for (const off of [-7, 0, 7]) { x.moveTo(6, off); x.lineTo(30, off); }
+    x.stroke();
+    x.strokeStyle = '#161b22'; x.lineWidth = 1.4;
+    x.beginPath();
+    for (const off of [-7, 0, 7]) { x.moveTo(24, off - 2.2); x.lineTo(30, off - 2.2); }
+    x.stroke();
+    const gr = x.createRadialGradient(-4, -4, 2, 0, 0, 16);
+    gr.addColorStop(0, '#7c899e'); gr.addColorStop(0.7, '#525c6b'); gr.addColorStop(1, '#3a434f');
+    x.fillStyle = gr;
+    x.beginPath(); x.arc(0, 0, 15, 0, TAU); x.fill();
+    x.strokeStyle = '#262d38'; x.lineWidth = 2; x.stroke();
+    x.fillStyle = '#6b7686';
+    x.beginPath(); x.arc(-3, -3, 6, 0, TAU); x.fill();
+    return c;
+  })();
+  const turretAim = [0, 0, Math.PI];
+  let frameDt = 0.016;
+
   // charred wreck versions
   const WRECK = {};
   for (const k in SPR) {
@@ -1683,6 +1768,34 @@ const Trinity = (() => {
     g.save(); g.translate(x, y); g.rotate(sh.face);
     g.drawImage(spr.cv, -drawSize / 2, -drawSize / 2, drawSize, drawSize);
     g.restore();
+
+    // live main battery: three turrets traverse onto the current target
+    if (isPlayer) {
+      const tgt2 = S.ships.find(s2 => s2.id === sh.batTargetId && s2.alive);
+      for (let i = 0; i < 3; i++) {
+        const slotX = [1.16, 0.64, -1.08][i];
+        const txp = x + Math.cos(sh.face) * slotX * rPx;
+        const typ = y + Math.sin(sh.face) * slotX * rPx;
+        let want2 = sh.face + (i === 2 ? Math.PI : 0);   // rest position
+        if (tgt2) {
+          const wa = Math.atan2(w2sy(tgt2.py + (tgt2.y - tgt2.py) * lerp) - typ,
+                                w2sx(tgt2.px + (tgt2.x - tgt2.px) * lerp) - txp);
+          let rel = wa - sh.face;
+          while (rel > Math.PI) rel -= TAU;
+          while (rel < -Math.PI) rel += TAU;
+          // fore turrets cover the front arc, the aft turret covers the rear
+          if (i < 2 ? Math.abs(rel) < 2.2 : Math.abs(rel) > 0.9) want2 = wa;
+        }
+        let diff2 = want2 - turretAim[i];
+        while (diff2 > Math.PI) diff2 -= TAU;
+        while (diff2 < -Math.PI) diff2 += TAU;
+        turretAim[i] += clamp(diff2, -6 * frameDt, 6 * frameDt);
+        const ts = rPx * 0.68;
+        g.save(); g.translate(txp, typ); g.rotate(turretAim[i]);
+        g.drawImage(TURRET_SPR, -ts / 2, -ts / 2, ts, ts);
+        g.restore();
+      }
+    }
 
     // overheat: the hull glows angry and sheds sparks
     if (isPlayer && S.heatOn) {
@@ -2434,13 +2547,15 @@ const Trinity = (() => {
         ry += rowH;
       }
     }
-    // broadcast bar
+    // broadcast bar (clickable / tappable)
+    broadcastRects.length = 0;
     const labels = [['1', 'FOCUS', 'focus'], ['2', 'DEFEND', 'defend'], ['3', 'FREE', 'free'], ['4', 'REGROUP', 'regroup']];
     let bx = 16;
-    const by = H - 122;
+    const by = H - 152;
     for (const [k, lab, val] of labels) {
       const active = S.fleetOrder === val;
       const wCh = 20 + lab.length * 7;
+      broadcastRects.push({ x: bx, y: by - 6, w: wCh, h: 32, val });
       sctx.fillStyle = active ? 'rgba(90,150,220,0.35)' : 'rgba(7,12,20,0.72)';
       roundRectPath(sctx, bx, by, wCh, 20, 4); sctx.fill();
       sctx.strokeStyle = active ? 'rgba(140,200,255,0.9)' : 'rgba(110,140,170,0.35)';
@@ -2461,7 +2576,7 @@ const Trinity = (() => {
     }
     for (const c of comms) c.life -= dtF;
     comms = comms.filter(c => c.life > 0);
-    let cy2 = H - 138;
+    let cy2 = H - 168;
     for (const c of comms) {
       sctx.globalAlpha = clamp(c.life / 2, 0, 0.95);
       sctx.fillStyle = '#a8d8c8'; sctx.font = '11px Consolas,monospace'; sctx.textAlign = 'left';
@@ -2471,6 +2586,32 @@ const Trinity = (() => {
     sctx.globalAlpha = 1;
   }
   const CLS_LABEL = { tackle: 'TACKLE', dps: 'DPS', logi: 'LOGI' };
+
+  const broadcastRects = [];
+
+  function drawTouchUI(S) {
+    const T2 = typeof Input !== 'undefined' && Input.touch ? Input.touch() : null;
+    if (!T2 || !T2.mode) return;
+    if (T2.joy.id !== null) {
+      sctx.strokeStyle = 'rgba(140,190,240,0.5)'; sctx.lineWidth = 2;
+      sctx.beginPath(); sctx.arc(T2.joy.cx, T2.joy.cy, 46, 0, TAU); sctx.stroke();
+      const m = Math.hypot(T2.joy.dx, T2.joy.dy) || 1;
+      const k3 = Math.min(m, 46) / m;
+      sctx.fillStyle = 'rgba(160,210,255,0.55)';
+      sctx.beginPath(); sctx.arc(T2.joy.cx + T2.joy.dx * k3, T2.joy.cy + T2.joy.dy * k3, 20, 0, TAU); sctx.fill();
+      sctx.lineWidth = 1;
+    }
+    for (const b of T2.btns) {
+      const held2 = T2.held[b.name] != null;
+      sctx.fillStyle = held2 ? 'rgba(120,180,240,0.45)' : 'rgba(10,16,26,0.55)';
+      sctx.beginPath(); sctx.arc(b.x, b.y, b.r, 0, TAU); sctx.fill();
+      sctx.strokeStyle = 'rgba(140,180,220,0.6)'; sctx.stroke();
+      sctx.fillStyle = '#cfe0f0'; sctx.font = 'bold 11px Consolas,monospace';
+      sctx.textAlign = 'center'; sctx.textBaseline = 'middle';
+      sctx.fillText(b.label, b.x, b.y);
+      sctx.textBaseline = 'alphabetic';
+    }
+  }
 
   // ---- fitting draft: pick 1 of 3 salvaged modules between waves ----
   const draftRects = [];
@@ -2868,20 +3009,36 @@ const Trinity = (() => {
       sctx.fillStyle = pg;
       sctx.beginPath(); sctx.arc(W / 2, pcy, prr, 0, TAU); sctx.fill();
       drawHeroShip();
+      const narrow = W < 700;
       const ly = Math.max(140, H * 0.185);
       drawStarburst(W / 2, ly - 24, Math.min(W, H) * 0.44);
-      drawArchedText('STAR BLAZERS', W / 2, ly, 560, 0.6, Math.min(80, W / 13));
+      drawArchedText('STAR BLAZERS', W / 2, ly, narrow ? 420 : 560, narrow ? 0.52 : 0.6, Math.min(80, W / 13));
       sctx.textAlign = 'center';
       sctx.fillStyle = '#ff9d5c'; sctx.font = 'bold 16px Consolas,monospace';
       sctx.fillText('—  C A R B O N   S K I R M I S H  —', W / 2, ly + 42);
       sctx.fillStyle = '#8fa4b8'; sctx.font = '12px Consolas,monospace';
       sctx.fillText('an unofficial fan tribute · Destiny simulates, Trinity draws, you fly', W / 2, ly + 62);
-      const bottom = drawControlCards(ly + 82);
+      let bottom;
+      if (narrow) {
+        // compact touch briefing instead of keyboard cards
+        const tl = [
+          'LEFT THUMB — steer the ship',
+          'RIGHT BUTTONS — BURN · WMG · MSL · HEAT',
+          'TAP a red ship to lock — your fleet',
+          'shoots what you lock. Menders first!',
+          'TAP the order chips to command the fleet'
+        ];
+        sctx.fillStyle = '#cfe0f0'; sctx.font = '13px Consolas,monospace';
+        tl.forEach((l, i) => sctx.fillText(l, W / 2, ly + 100 + i * 22));
+        bottom = ly + 100 + tl.length * 22;
+      } else {
+        bottom = drawControlCards(ly + 82);
+      }
       if (Math.floor(performance.now() / 500) % 2 === 0) {
         sctx.save();
         sctx.shadowColor = 'rgba(255,200,90,0.9)'; sctx.shadowBlur = 14;
         sctx.fillStyle = '#ffe9b0'; sctx.font = 'bold 17px Consolas,monospace'; sctx.textAlign = 'center';
-        sctx.fillText('— press any key to launch —', W / 2, Math.min(bottom + 40, H - 16));
+        sctx.fillText('— press any key or tap to launch —', W / 2, Math.min(bottom + 40, H - 16));
         sctx.restore();
       }
     } else if (S.mode === 'play' && S.paused) {
@@ -2958,6 +3115,7 @@ const Trinity = (() => {
     const now = performance.now() / 1000;
     const dtF = clamp(now - lastFrame, 0.001, 0.05);
     lastFrame = now;
+    frameDt = dtF;
 
     // camera: lead ahead of velocity so motion reads instantly
     const ptx = p.px + (p.x - p.px) * lerp, pty = p.py + (p.y - p.py) * lerp;
@@ -3160,6 +3318,7 @@ const Trinity = (() => {
       drawPanels(S);
       drawRadar(S);
       drawFleetUI(S, dtF);
+      drawTouchUI(S);
     }
     if (S.mode === 'play' && !S.paused) {
       drawTutorial(S, dtF);
@@ -3190,6 +3349,11 @@ const Trinity = (() => {
     draftHit: (x, y) => {
       for (const r of draftRects)
         if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return r.pick;
+      return null;
+    },
+    orderHit: (x, y) => {
+      for (const r of broadcastRects)
+        if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return r.val;
       return null;
     }
   };
@@ -3380,12 +3544,49 @@ const Input = (() => {
   });
   window.addEventListener('blur', () => held.clear());
 
-  document.getElementById('cv').addEventListener('mousedown', e => {
+  // ---- touch: left-half virtual stick, right-side buttons, tap to lock ----
+  let touchMode = false;
+  const joy = { id: null, cx: 0, cy: 0, dx: 0, dy: 0 };
+  const heldBtns = {};
+  function touchButtons() {
+    const W2 = window.innerWidth, H2 = window.innerHeight;
+    return [
+      { name: 'burn', label: 'BURN', x: W2 - 52, y: H2 - 264, r: 34 },
+      { name: 'wmg', label: 'WMG', x: W2 - 52, y: H2 - 180, r: 34 },
+      { name: 'msl', label: 'MSL', x: W2 - 52, y: H2 - 96, r: 34 },
+      { name: 'heat', label: 'HEAT', x: W2 - 130, y: H2 - 96, r: 28 }
+    ];
+  }
+  const cvEl = document.getElementById('cv');
+  cvEl.addEventListener('pointerdown', e => {
     Aura.ensure();
     anyKey = true;
-    const rect = e.target.getBoundingClientRect();
+    if (e.pointerType === 'touch') {
+      touchMode = true;
+      e.preventDefault();
+      const btn = touchButtons().find(b => Math.hypot(e.clientX - b.x, e.clientY - b.y) <= b.r + 14);
+      if (btn) {
+        heldBtns[btn.name] = e.pointerId;
+        if (btn.name === 'msl') missileKey = true;
+        return;
+      }
+      if (e.clientX < window.innerWidth * 0.42 && joy.id === null) {
+        joy.id = e.pointerId; joy.cx = e.clientX; joy.cy = e.clientY; joy.dx = 0; joy.dy = 0;
+        return;
+      }
+    }
+    const rect = cvEl.getBoundingClientRect();
     click = { x: e.clientX - rect.left, y: e.clientY - rect.top };
   });
+  window.addEventListener('pointermove', e => {
+    if (e.pointerId === joy.id) { joy.dx = e.clientX - joy.cx; joy.dy = e.clientY - joy.cy; }
+  });
+  const endPointer = e => {
+    if (e.pointerId === joy.id) { joy.id = null; joy.dx = 0; joy.dy = 0; }
+    for (const bn in heldBtns) if (heldBtns[bn] === e.pointerId) delete heldBtns[bn];
+  };
+  window.addEventListener('pointerup', endPointer);
+  window.addEventListener('pointercancel', endPointer);
 
   function consume() {
     let tx = 0, ty = 0;
@@ -3393,11 +3594,12 @@ const Input = (() => {
     if (held.has('s')) ty += 1;
     if (held.has('a')) tx -= 1;
     if (held.has('d')) tx += 1;
+    if (joy.id !== null && Math.hypot(joy.dx, joy.dy) > 12) { tx = joy.dx; ty = joy.dy; }
     const cmd = {
       thrustX: tx, thrustY: ty,
-      ab: held.has('shift'),
-      wmg: held.has(' '),
-      heat: held.has('g'),
+      ab: held.has('shift') || heldBtns.burn != null,
+      wmg: held.has(' ') || heldBtns.wmg != null,
+      heat: held.has('g') || heldBtns.heat != null,
       tab, restart, anyKey, pause,
       overtime: overtimeKey,
       missile: missileKey,
@@ -3407,7 +3609,9 @@ const Input = (() => {
     };
     if (click) {
       const dp = Trinity.draftHit(click.x, click.y);
+      const oh = dp ? null : Trinity.orderHit(click.x, click.y);
       if (dp) cmd.pick = dp;
+      else if (oh) cmd.order = oh;
       else {
         const id = Trinity.overviewHit(click.x, click.y);
         if (id != null) cmd.lockId = id;
@@ -3417,7 +3621,7 @@ const Input = (() => {
     tab = false; restart = false; anyKey = false; pause = false; overtimeKey = false; missileKey = false; orderKey = null; pickKey = 0; click = null;
     return cmd;
   }
-  return { consume };
+  return { consume, touch: () => ({ mode: touchMode, joy, btns: touchButtons(), held: heldBtns }) };
 })();
 
 (function main() {
