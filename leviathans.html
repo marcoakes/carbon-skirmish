@@ -14,7 +14,7 @@
 <script>
 "use strict";
 /* =====================================================================
-   LEVIATHANS — a capital-class carrier duel  [build v2.4-yamato-title]
+   LEVIATHANS — a capital-class carrier duel  [build v2.5-even-odds]
    (companion piece to STAR BLAZERS: Carbon Skirmish — same DNA:
     a fixed-tick simulation that owns all state, a renderer that only
     reads it, and WebAudio synthesis for every sound. One file, no deps.)
@@ -83,10 +83,11 @@ const Sim = (() => {
 
   function makeFighter(side, squad, slot) {
     const role = ROLES[SQUADS[squad]];
+    const hp = Math.round(role.hp * (side === 'P' ? 1.25 : 1));   // veteran crews
     return {
       id: nextId++, side, squad, slot, role: SQUADS[squad],
       x: 0, y: 0, vx: 0, vy: 0, face: 0,
-      hp: role.hp, max: role.hp, ammo: role.ammo, ammoMax: role.ammo,
+      hp, max: hp, ammo: role.ammo, ammoMax: role.ammo,
       state: 'docked', order: 'defend', gunCd: R(), runT: 0, tId: 0,
       repairing: false, alive: true
     };
@@ -110,11 +111,10 @@ const Sim = (() => {
       tut: 0, tutT: 0
     };
     S.E.hull = S.E.hullMax = DIFF[di].ehull;
-    for (let sq = 0; sq < 3; sq++)
-      for (let sl = 0; sl < 6; sl++) {
-        S.fighters.push(makeFighter('P', sq, sl));
-        S.fighters.push(makeFighter('E', sq, sl));
-      }
+    for (let sq = 0; sq < 3; sq++) {
+      for (let sl = 0; sl < 8; sl++) S.fighters.push(makeFighter('P', sq, sl));
+      for (let sl = 0; sl < 6; sl++) S.fighters.push(makeFighter('E', sq, sl));
+    }
     return S;
   }
 
@@ -195,9 +195,9 @@ const Sim = (() => {
         evt({ type: 'subup', side: c.side, key: k });
       }
     }
-    // hangar repair bays: 5 docked fighters healed concurrently (triage = dock order)
+    // hangar repair bays: docked fighters healed concurrently (triage = dock order)
     if (!c.subs.hangar.disabled) {
-      let bays = 5;
+      let bays = c.side === 'P' ? 6 : 5;
       for (const f of S.fighters) {
         if (!f.alive || f.side !== c.side || f.state !== 'docked') continue;
         f.repairing = false;
@@ -613,18 +613,20 @@ const Sim = (() => {
       const ready = docked.filter(f => f.hp > f.max * 0.5);
       if (ready.length >= (S.diff.aggro > 1 ? 1 : 2)) launchSquad(E, sq);
     }
-    for (const f of S.fighters) {
-      if (!f.alive || f.side !== 'E' || f.state === 'docked' || f.state === 'recall') continue;
-      if (f.hp < f.max * 0.34 || f.ammo <= 0) f.state = 'recall';   // the AI feels each loss
-    }
     // threat response: player fighters near our hull → scramble defense
     const nearThreats = S.fighters.filter(f => f.alive && f.side === 'P' && f.state !== 'docked'
       && dist(f.x, f.y, E.x, E.y) < 700).length;
-    if (nearThreats >= 3) orderSquad(E, 3, 'intercept');
+    if (nearThreats >= 5) orderSquad(E, 3, 'intercept');
     else {
       orderSquad(E, 0, 'intercept');
       orderSquad(E, 1, 'strike');
-      orderSquad(E, 2, R() < 0.4 * S.diff.aggro ? 'strike' : 'defend');
+      // smell blood: when the player is hurt, everything goes on the attack
+      orderSquad(E, 2, (P.hull < P.hullMax * 0.35 || R() < 0.4 * S.diff.aggro) ? 'strike' : 'defend');
+    }
+    // recall the dying and the dry — AFTER orders, so nothing overrides the retreat
+    for (const f of S.fighters) {
+      if (!f.alive || f.side !== 'E' || f.state === 'docked') continue;
+      if (f.hp < f.max * 0.34 || f.ammo <= 0) f.state = 'recall';   // the AI feels each loss
     }
   }
 
@@ -1165,17 +1167,17 @@ const Render = (() => {
     // ===== squadron roster (top-left) =====
     rects.squads.length = 0;
     const sy0 = 12;
-    sctx.fillStyle = 'rgba(6,10,16,0.78)'; sctx.fillRect(14, sy0, 252, 118);
-    sctx.strokeStyle = 'rgba(110,160,210,0.4)'; sctx.strokeRect(14.5, sy0 + 0.5, 252, 118);
+    sctx.fillStyle = 'rgba(6,10,16,0.78)'; sctx.fillRect(14, sy0, 316, 118);
+    sctx.strokeStyle = 'rgba(110,160,210,0.4)'; sctx.strokeRect(14.5, sy0 + 0.5, 316, 118);
     sctx.fillStyle = '#9fc0dd'; sctx.font = 'bold 10px Consolas,monospace';
     sctx.fillText('WINGS  [1-3] select · [4] all · [L]aunch', 22, sy0 + 14);
     for (let sq = 0; sq < 3; sq++) {
       const yy = sy0 + 24 + sq * 24;
       const seld = S.sel === sq || S.sel === 3;
-      if (seld) { sctx.fillStyle = 'rgba(120,180,240,0.14)'; sctx.fillRect(18, yy - 2, 244, 22); }
+      if (seld) { sctx.fillStyle = 'rgba(120,180,240,0.14)'; sctx.fillRect(18, yy - 2, 308, 22); }
       sctx.fillStyle = seld ? '#cfe4f8' : '#8fa4b8'; sctx.font = 'bold 9px Consolas,monospace';
       sctx.fillText((sq + 1) + ' ' + Sim.ROLES[Sim.SQUADS[sq]].label.slice(0, 6), 22, yy + 9);
-      rects.squads.push({ x: 18, y: yy - 2, w: 244, h: 22, sq });
+      rects.squads.push({ x: 18, y: yy - 2, w: 308, h: 22, sq });
       const members = S.fighters.filter(f => f.side === 'P' && f.squad === sq);
       members.forEach((f, i) => {
         const fx = 88 + i * 30;
@@ -1304,7 +1306,7 @@ const Render = (() => {
       sctx.stroke();
       sctx.restore();
       sctx.fillStyle = '#ffb894'; sctx.font = 'italic 14px Georgia,serif';
-      sctx.fillText('a space battleship saga — two leviathans, a hundred sparks between them', W / 2, H * 0.27 + 54);
+      sctx.fillText('a space battleship saga — launch your fighters and bombers, and bring them home', W / 2, H * 0.27 + 54);
       const lines = [
         ['HELM', 'W/S thrust · A/D turn — she is fast for a leviathan. Use it.'],
         ['ARSENAL', 'LMB broadside (show your FLANK) · T/RMB missile barrage · SPACE spinal torps'],
