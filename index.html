@@ -198,7 +198,9 @@ const Destiny = (() => {
       fleetOrder: 'focus', fleetLost: [], waveWingLost: false,
       mods: {}, draft: null, killsBy: {}, heatOn: false, heatUsed: false, wmgCdMax: 45,
       echelon: null, echelonAt: 0, vanguard: false,
-      stats: { shots: 0, hits: 0, endT: 0 }
+      stats: { shots: 0, hits: 0, endT: 0, firstBloodT: -1, peakCombo: 0,
+               taken: {}, dealt: {}, waveTimes: [], drafts: [],
+               secWebbed: 0, secOverheat: 0, dryFires: 0, wingDeaths: 0 }
     };
     S.player = makeShip('player', 'Your Ship', 0, 0);
     S.ships.push(S.player);
@@ -331,6 +333,7 @@ const Destiny = (() => {
     const m = S.draft && S.draft[i];
     if (!m) return;
     S.mods[m.id] = (S.mods[m.id] || 0) + 1;
+    S.stats.drafts.push(m.id);
     if (m.id === 'msl') S.player.msl = Math.min(mslMax(), S.player.msl + 2);
     S.draft = null;
     S.events.push({ type: 'fitted', name: m.name });
@@ -347,6 +350,14 @@ const Destiny = (() => {
     if (sh.shield > 0) { const d = Math.min(sh.shield, left); sh.shield -= d; left -= d; }
     if (left > 0 && sh.armor > 0) { const d = Math.min(sh.armor, left); sh.armor -= d; left -= d; }
     if (left > 0) sh.hull -= left;
+    // ---- telemetry: who is dealing/taking damage, by source ----
+    const st = S.stats;
+    if (sh === S.player) st.taken[srcCls || 'gun'] = (st.taken[srcCls || 'gun'] || 0) + dmg;
+    else if (sh.faction === 'hostile') {
+      const wpn = srcCls === 'missile' ? 'missile' : srcCls === 'wmg' ? 'wmg'
+        : srcName === 'Your Ship' ? 'gun' : 'fleet';
+      st.dealt[wpn] = (st.dealt[wpn] || 0) + dmg;
+    }
     S.events.push({ type: 'dmg', x: sh.x, y: sh.y - sh.radius - 8, amount: dmg, layer, target: sh.id });
     S.events.push({ type: 'hit', x: sh.x, y: sh.y, r: sh.radius, layer, player: sh === S.player, target: sh.id });
     if (sh.hull <= 0 && sh.alive) {
@@ -355,6 +366,7 @@ const Destiny = (() => {
       S.events.push({ type: 'boom', x: sh.x, y: sh.y, r: sh.radius, big: sh.cls === 'cruiser' });
       if (sh.faction === 'hostile') {
         S.kills++;
+        if (S.stats.firstBloodT < 0) S.stats.firstBloodT = S.t;
         const credit = srcName ? (srcName === 'Your Ship' ? 'FC' : srcName) : 'FC';
         S.killsBy[credit] = (S.killsBy[credit] || 0) + 1;
         // score, with a 6-second kill-chain multiplier
@@ -364,6 +376,7 @@ const Destiny = (() => {
         S.comboT = 6;
         const pts = Math.round(base * S.combo * (S.vanguard ? 1.5 : 1));
         S.score += pts;
+        if (S.combo > S.stats.peakCombo) S.stats.peakCombo = S.combo;
         S.events.push({ type: 'kill', name: sh.name, combo: S.combo });
         S.events.push({ type: 'score', x: sh.x, y: sh.y - sh.radius - 24, pts, combo: S.combo });
         // wrecks drop salvage worth flying into the fight for
@@ -388,6 +401,7 @@ const Destiny = (() => {
       } else if (sh.faction === 'player') {
         S.fleetLost.push([sh.cls, sh.name]);
         S.waveWingLost = true;
+        S.stats.wingDeaths++;
         S.events.push({ type: 'wingdown', name: sh.name });
       }
       if (S.lockTargetId === sh.id) { S.lockTargetId = null; S.locked = false; S.lockProgress = 0; }
@@ -539,6 +553,7 @@ const Destiny = (() => {
     S.heatOn = !!cmd.heat && p.hull > 16;
     if (S.heatOn) {
       p.hull -= 4 * TICK;
+      S.stats.secOverheat += TICK;
       if (!S.heatUsed) { S.heatUsed = true; S.events.push({ type: 'heaton' }); }
     }
 
@@ -549,6 +564,7 @@ const Destiny = (() => {
       if (w && Math.hypot(h.x - p.x, h.y - p.y) <= w) S.webbedBy.push(h.id);
     }
     const webbed = S.webbedBy.length > 0;
+    if (webbed) S.stats.secWebbed += TICK;
     if (webbed && !S.wasWebbed) S.events.push({ type: 'webbed' });
     S.wasWebbed = webbed;
 
@@ -664,7 +680,7 @@ const Destiny = (() => {
         fire(p, batTgt, d.gunDmg * (1 + 0.15 * modN('gun')) * rr(0.85, 1.15),
           d.pspeed, d.gunRange + 200, d.track * (1 + 0.25 * modN('track')), bx5, by5);
         p.gunCd = d.gunRof / (S.heatOn ? 1.5 : 1);
-      } else { S.capEmptyFlash = 1.2; p.gunCd = 0.3; }
+      } else { S.capEmptyFlash = 1.2; p.gunCd = 0.3; S.stats.dryFires++; }
     }
 
     // missiles: fire-and-forget at the locked target
@@ -1024,6 +1040,7 @@ const Destiny = (() => {
     }
     if (!S.overtime && S.wave > 0 && S.clearedAnnounced < S.wave) {
       S.clearedAnnounced = S.wave;
+      S.stats.waveTimes.push(Math.round(S.t - S.waveStartT));
       let bonus = 500 * S.wave, sub = '+' + bonus + ' clear bonus';
       if (S.player.hull >= S.waveHullStart) { bonus += 750; sub += ' · +750 untouched hull'; }
       if (!S.waveWingLost) { bonus += 500; sub += ' · +500 fleet intact'; }
@@ -3016,6 +3033,69 @@ const Trinity = (() => {
     return m + ':' + (s < 10 ? '0' : '') + s;
   }
 
+  /* ---------------- playtest instrumentation: after-action report ---------------- */
+  let debriefOn = false;
+  const pctMap = m => {
+    const tot = Object.values(m).reduce((a, b) => a + b, 0) || 1;
+    return Object.entries(m).sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => k + ' ' + Math.round(100 * v / tot) + '%');
+  };
+  function buildReport(S) {
+    const st = S.stats;
+    const acc = st.shots ? Math.round(100 * st.hits / st.shots) : 0;
+    const obj = {
+      outcome: S.mode, seed: S.seed || 'default', vanguard: !!S.vanguard,
+      timeSec: Math.round(st.endT), score: S.score, kills: S.kills,
+      wavesReached: S.overtime ? 'OT' + S.otWave : S.wave,
+      firstBloodSec: st.firstBloodT < 0 ? null : Math.round(st.firstBloodT),
+      waveClearSecs: st.waveTimes, turretAccuracyPct: acc, peakCombo: st.peakCombo,
+      dmgTakenBySource: st.taken, dmgDealtByWeapon: st.dealt,
+      drafts: st.drafts, wingDeaths: st.wingDeaths,
+      secWebbed: Math.round(st.secWebbed), secOverheat: Math.round(st.secOverheat),
+      dryFires: st.dryFires,
+      deathCause: S.mode === 'dead' && S.deathInfo ? S.deathInfo.src : null
+    };
+    const L = [];
+    L.push('STAR BLAZERS — after-action report');
+    L.push(obj.outcome.toUpperCase() + ' · ' + fmtTime(st.endT) + ' · ' + S.score.toLocaleString() + ' pts · '
+      + S.kills + ' kills · ' + acc + '% acc' + (S.vanguard ? ' · VANGUARD' : '')
+      + (S.seed ? ' · DAILY ' + S.seed : ''));
+    if (obj.deathCause) L.push('killed by: ' + obj.deathCause);
+    L.push('first blood: ' + (obj.firstBloodSec == null ? '—' : obj.firstBloodSec + 's')
+      + ' · wave clears: ' + (st.waveTimes.join('s, ') + (st.waveTimes.length ? 's' : '—'))
+      + ' · peak chain: x' + st.peakCombo);
+    L.push('damage TAKEN: ' + (pctMap(st.taken).join(' · ') || '—'));
+    L.push('damage DEALT: ' + (pctMap(st.dealt).join(' · ') || '—'));
+    L.push('pressure: webbed ' + obj.secWebbed + 's · overheat ' + obj.secOverheat
+      + 's · dry-fires ' + st.dryFires + ' · wingmen lost ' + st.wingDeaths);
+    L.push('fittings: ' + (st.drafts.join(', ') || 'none'));
+    return { obj, text: L.join('\n') };
+  }
+  function copyReport(S) {
+    const rep = buildReport(S);
+    const done = () => note('AFTER-ACTION REPORT COPIED — paste it to Fable');
+    const fb = () => { try { prompt('After-action report:', rep.text); } catch (e) {} };
+    if (navigator.clipboard && navigator.clipboard.writeText)
+      navigator.clipboard.writeText(rep.text).then(done, fb);
+    else fb();
+  }
+  function drawDebrief(S) {
+    if (!debriefOn) return;
+    const rep = buildReport(S), lines = rep.text.split('\n');
+    const bw = Math.min(680, W - 40), bx = W / 2 - bw / 2, by = H * 0.5;
+    sctx.fillStyle = 'rgba(4,8,14,0.92)';
+    roundRectPath(sctx, bx, by, bw, 26 + lines.length * 20, 10); sctx.fill();
+    sctx.strokeStyle = 'rgba(120,180,255,0.5)'; sctx.stroke();
+    sctx.textAlign = 'left';
+    lines.forEach((l, i) => {
+      sctx.fillStyle = i === 0 ? '#9fc0dd' : i === 1 ? '#ffd978' : '#c3d2e0';
+      sctx.font = (i === 0 ? 'bold 13px' : '12px') + ' Consolas,monospace';
+      sctx.fillText(l, bx + 16, by + 24 + i * 20);
+    });
+    sctx.fillStyle = 'rgba(150,175,200,0.7)'; sctx.font = '10px Consolas,monospace'; sctx.textAlign = 'center';
+    sctx.fillText('[J] copy this report to clipboard · [K] hide', W / 2, by + 24 + lines.length * 20 + 4);
+  }
+
   /* ---------------- keycaps, control cards, tutorial ---------------- */
   function roundRectPath(c, x, y, w, h, r) {
     c.beginPath();
@@ -3345,7 +3425,7 @@ const Trinity = (() => {
       sctx.fillStyle = '#f0c85a'; sctx.font = '13px Consolas,monospace';
       sctx.fillText(tip, W / 2, H * 0.4 + 56);
       sctx.fillStyle = '#eaf2fa'; sctx.font = 'bold 14px Consolas,monospace';
-      sctx.fillText('press R to refit and warp back  ·  [C] copy replay code', W / 2, H * 0.4 + 86);
+      sctx.fillText('press R to refit  ·  [C] replay code  ·  [K] after-action report', W / 2, H * 0.4 + 86);
     } else if (S.mode === 'victory') {
       sctx.fillStyle = 'rgba(3,14,8,0.4)'; sctx.fillRect(0, 0, W, H);
       sctx.textAlign = 'center';
@@ -3373,7 +3453,7 @@ const Trinity = (() => {
       if (Math.floor(performance.now() / 500) % 2 === 0)
         sctx.fillText('press N for OVERTIME — endless reinforcements, keep your score', W / 2, H * 0.4 + 110);
       sctx.fillStyle = '#eaf2fa'; sctx.font = '13px Consolas,monospace';
-      sctx.fillText('or press R to fly the site again  ·  [C] copy replay code', W / 2, H * 0.4 + 134);
+      sctx.fillText('press R to fly again  ·  [C] replay code  ·  [K] after-action report', W / 2, H * 0.4 + 134);
     }
   }
 
@@ -3654,6 +3734,7 @@ const Trinity = (() => {
     }
 
     if (!photo) overlay(S);
+    if (!photo && (S.mode === 'dead' || S.mode === 'victory')) drawDebrief(S);
 
     // retro CRT mode [T]: scanlines, phosphor flicker, tube vignette
     if (crt) {
@@ -3686,6 +3767,8 @@ const Trinity = (() => {
   return {
     render,
     note: t => { banner = { text: t, sub: null, life: 3 }; },
+    copyReport: () => copyReport(Destiny.state()),
+    toggleDebrief: () => { debriefOn = !debriefOn; return debriefOn; },
     toggleCrt: () => {
       crt = !crt;
       try { localStorage.setItem('cs_crt', crt ? '1' : '0'); } catch (e) {}
@@ -3987,10 +4070,12 @@ const Input = (() => {
       if (window.__savePhoto) window.__savePhoto();
       return;
     }
-    if (k === 'c' || k === 'v' || k === 'b' || k === 't' || k === 'x' || k === 'o') {
+    if (k === 'c' || k === 'v' || k === 'b' || k === 't' || k === 'x' || k === 'o' || k === 'j' || k === 'k') {
       // meta keys never launch the game
       if (k === 'c' && window.__copyReplay) window.__copyReplay();
       if (k === 'v' && window.__watchReplay) window.__watchReplay();
+      if (k === 'j') Trinity.copyReport();
+      if (k === 'k') Trinity.toggleDebrief();
       if (k === 'b' && Meta.unlocked())
         Trinity.note('VANGUARD ' + (Meta.toggleVanguard() ? 'ARMED — +35% enemies, ×1.5 score' : 'STOOD DOWN'));
       if (k === 't') Trinity.note('CRT MODE ' + (Trinity.toggleCrt() ? 'ON' : 'OFF'));
