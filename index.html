@@ -14,10 +14,11 @@
 <script>
 "use strict";
 /* =====================================================================
-   STAR BLAZERS — CARBON SKIRMISH v10
+   STAR BLAZERS — CARBON SKIRMISH v11
    (an unofficial fan tribute to Star Blazers / Space Battleship Yamato)
-   Now with live traversing turrets, two-echelon waves, full 360° helm
-   control, and touch controls for mobile.
+   The final act: shareable deterministic replays ([C] to copy, [V] to
+   watch), the dreadnought EXECRATION with destructible subsystems as
+   wave 4, and a persistent service record with VANGUARD new-game+.
    A structural homage to CCP's open-sourced Carbon engine.
    You fly a space battleship in the spirit of the Yamato — complete
    with a Wave Motion Gun — and you are the FC of a five-ship wing.
@@ -97,7 +98,22 @@ const Destiny = (() => {
                gunDmg: 30, gunRof: 2.6, gunRange: 920, pspeed: 800, track: 0.5,
                torpRof: 7, torpDmg: 55, torpSpeed: 310, torpTurn: 1.3,
                torpLife: 14, torpDet: 26,
-               lock: 4.5, label: 'Sanguine Vesper' }
+               lock: 4.5, label: 'Sanguine Vesper' },
+    // ---- the final act: a dreadnought made of destructible pieces ----
+    dread:   { radius: 48, speed: 45, orbit: 700, inertia: 0.5,
+               shield: 700, sregen: 4, armor: 900, hull: 850,
+               lock: 5, label: 'EXECRATION' },
+    subturret: { radius: 12, speed: 0, inertia: 1, shield: 90, sregen: 2,
+               armor: 140, hull: 120, gunDmg: 26, gunRof: 3, gunRange: 950,
+               pspeed: 800, track: 0.45, lock: 1.8, sub: true,
+               label: 'Execration — Turret Battery' },
+    subtorp: { radius: 12, speed: 0, inertia: 1, shield: 90, sregen: 2,
+               armor: 130, hull: 110, torpRof: 8, torpDmg: 45, torpSpeed: 300,
+               torpTurn: 1.2, torpLife: 12, torpDet: 26, lock: 1.8, sub: true,
+               label: 'Execration — Torpedo Bay' },
+    subgen:  { radius: 11, speed: 0, inertia: 1, shield: 120, sregen: 3,
+               armor: 160, hull: 140, lock: 1.8, sub: true,
+               label: 'Execration — Shield Nexus' }
   };
 
   /* waves arrive in two echelons: the opening group, then reinforcements
@@ -115,7 +131,11 @@ const Destiny = (() => {
     { banner: 'WAVE 3 — THE SANGUINE VESPER', ring: false,
       sub: 'Primary her Mender when it lands, then get under her guns.',
       ships: [['cruiser', 'Sanguine Vesper'], ['escort'], ['escort']],
-      echelon: [['hlogi'], ['scout'], ['scout']] }
+      echelon: [['hlogi'], ['scout'], ['scout']] },
+    { banner: 'WAVE 4 — THE EXECRATION', ring: false,
+      sub: 'Dreadnought. Her SHIELD NEXUS makes the hull untouchable — break it first.',
+      ships: [['dread', 'EXECRATION'], ['escort'], ['escort']],
+      echelon: [['hlogi'], ['frigate'], ['scout']] }
   ];
 
   const FLEET = [['tackle', 'Talon'], ['tackle', 'Grip'], ['dps', 'Hammer'], ['dps', 'Anvil'], ['logi', 'Mercy']];
@@ -152,7 +172,7 @@ const Destiny = (() => {
       msl: cls === 'player' ? 6 : 0, mslCd: 0,
       bossPhase: 0, lance: null, lanceCd: 0, lanceTick: 0,
       wing: false, aimId: null, aimT: 0, webbedT: 0, repTargetId: null, webbingId: null,
-      batTargetId: null,
+      batTargetId: null, parentId: null, subX: 0, subY: 0,
       orbitDir: rng() < 0.5 ? 1 : -1, muzzle: 1,
       alive: true, wreck: false, wreckT: 0, spin: 0
     };
@@ -175,11 +195,18 @@ const Destiny = (() => {
       overtime: false, otWave: 0, otCleared: 0, waveHullStart: 260,
       fleetOrder: 'focus', fleetLost: [], waveWingLost: false,
       mods: {}, draft: null, killsBy: {}, heatOn: false, heatUsed: false, wmgCdMax: 45,
-      echelon: null, echelonAt: 0,
+      echelon: null, echelonAt: 0, vanguard: false,
       stats: { shots: 0, hits: 0, endT: 0 }
     };
     S.player = makeShip('player', 'Your Ship', 0, 0);
     S.ships.push(S.player);
+  }
+
+  function vanguardize(sh) {
+    if (!S.vanguard) return;
+    sh.shield *= 1.35; sh.shieldMax = sh.shield;
+    sh.armor *= 1.35; sh.armorMax = sh.armor;
+    sh.hull *= 1.35; sh.hullMax = sh.hull;
   }
 
   function spawnGroup(list, ring) {
@@ -194,8 +221,20 @@ const Destiny = (() => {
         S.player.y + Math.sin(ang) * dist);
       // arrive out of warp with velocity toward the fight
       sh.vx = -Math.cos(ang) * 220; sh.vy = -Math.sin(ang) * 220;
+      vanguardize(sh);
       S.ships.push(sh);
-      S.events.push({ type: 'warpin', x: sh.x, y: sh.y, ang: ang + Math.PI, big: spec[0] === 'cruiser' });
+      S.events.push({ type: 'warpin', x: sh.x, y: sh.y, ang: ang + Math.PI,
+        big: spec[0] === 'cruiser' || spec[0] === 'dread' });
+      if (spec[0] === 'dread') {
+        // her weapons and shield generator are separate, killable pieces
+        for (const [sx3, sy3, scls] of [[35, -32, 'subturret'], [35, 32, 'subturret'],
+                                        [-15, -34, 'subtorp'], [-55, 0, 'subgen']]) {
+          const sub = makeShip(scls, null, sh.x + sx3, sh.y + sy3);
+          sub.parentId = sh.id; sub.subX = sx3; sub.subY = sy3;
+          vanguardize(sub);
+          S.ships.push(sub);
+        }
+      }
     });
   }
 
@@ -296,6 +335,10 @@ const Destiny = (() => {
   }
 
   function applyDamage(sh, dmg, srcCls, srcName) {
+    // the Execration's hull is near-untouchable while her Shield Nexus lives
+    if (sh.cls === 'dread' &&
+        S.ships.some(q => q.alive && q.cls === 'subgen' && q.parentId === sh.id))
+      dmg *= 0.15;
     let left = dmg, layer = 'hull';
     if (sh.shield > 0.5) layer = 'shield';
     else if (sh.armor > 0.5) layer = 'armor';
@@ -313,10 +356,11 @@ const Destiny = (() => {
         const credit = srcName ? (srcName === 'Your Ship' ? 'FC' : srcName) : 'FC';
         S.killsBy[credit] = (S.killsBy[credit] || 0) + 1;
         // score, with a 6-second kill-chain multiplier
-        const base = { scout: 100, frigate: 250, escort: 300, cruiser: 1500 }[sh.cls] || 100;
+        const base = { scout: 100, frigate: 250, escort: 300, cruiser: 1500,
+          hlogi: 400, dread: 3000, subturret: 350, subtorp: 350, subgen: 500 }[sh.cls] || 100;
         S.combo = S.comboT > 0 ? S.combo + 1 : 1;
         S.comboT = 6;
-        const pts = base * S.combo;
+        const pts = Math.round(base * S.combo * (S.vanguard ? 1.5 : 1));
         S.score += pts;
         S.events.push({ type: 'kill', name: sh.name, combo: S.combo });
         S.events.push({ type: 'score', x: sh.x, y: sh.y - sh.radius - 24, pts, combo: S.combo });
@@ -330,6 +374,11 @@ const Destiny = (() => {
             life: 12
           });
         }
+      }
+      if (sh.cls === 'dread') {
+        // the hull goes, and everything bolted to it goes with her
+        for (const q of S.ships.slice())
+          if (q.alive && q.parentId === sh.id) applyDamage(q, 1e6, 'chain', srcName);
       }
       if (sh === S.player) {
         S.mode = 'dead'; S.stats.endT = S.t;
@@ -641,6 +690,36 @@ const Destiny = (() => {
   function tickHostile(sh) {
     const d = CLS[sh.cls], p = S.player;
     if (sh.webbedT > 0) sh.webbedT -= TICK;
+
+    // hull-mounted subsystems ride the dreadnought and fight independently
+    if (d.sub) {
+      const par = S.ships.find(q => q.id === sh.parentId && q.alive);
+      if (!par) return;
+      const ca = Math.cos(par.face), sa = Math.sin(par.face);
+      sh.x = par.x + sh.subX * ca - sh.subY * sa;
+      sh.y = par.y + sh.subX * sa + sh.subY * ca;
+      sh.vx = 0; sh.vy = 0;
+      const st = pickAim(sh);
+      if (st && d.gunDmg) {
+        sh.face = Math.atan2(st.y - sh.y, st.x - sh.x);
+        const sd = Math.hypot(st.x - sh.x, st.y - sh.y);
+        sh.gunCd -= TICK;
+        if (sh.gunCd <= 0 && sd <= d.gunRange) {
+          fire(sh, st, d.gunDmg * rr(0.85, 1.15), d.pspeed, d.gunRange + 200, d.track);
+          sh.gunCd = d.gunRof * rr(0.9, 1.25);
+        }
+      } else sh.face = par.face;
+      if (d.torpRof && p.alive) {
+        sh.torpCd -= TICK;
+        if (sh.torpCd <= 0 && Math.hypot(p.x - sh.x, p.y - sh.y) < 1500) {
+          for (let i = 0; i < 3; i++) launchTorp(sh, d, (i - 1) * 0.22);
+          sh.torpCd = d.torpRof;
+        }
+      }
+      sh.shield = Math.min(sh.shieldMax, sh.shield + d.sregen * TICK);
+      return;
+    }
+
     const t = pickAim(sh);
     if (!t) {
       steer(sh, Math.cos(sh.face), Math.sin(sh.face), d.speed * 0.35, d.inertia);
@@ -902,6 +981,7 @@ const Destiny = (() => {
       sh.shield *= boost; sh.shieldMax = sh.shield;
       sh.armor *= boost; sh.armorMax = sh.armor;
       sh.hull *= boost; sh.hullMax = sh.hull;
+      vanguardize(sh);
       sh.vx = -Math.cos(ang) * 220; sh.vy = -Math.sin(ang) * 220;
       S.ships.push(sh);
       S.events.push({ type: 'warpin', x: sh.x, y: sh.y, ang: ang + Math.PI, big: cls === 'cruiser' });
@@ -933,7 +1013,7 @@ const Destiny = (() => {
     if (!S.overtime && S.wave >= WAVES.length) {
       if (S.mode === 'play') {
         S.mode = 'victory'; S.stats.endT = S.t;
-        S.score += 2000;
+        S.score += Math.round(2000 * (S.vanguard ? 1.5 : 1));
         S.events.push({ type: 'banner', text: 'SITE SECURED', sub: '+2000 site bonus' });
       }
       return;
@@ -943,7 +1023,7 @@ const Destiny = (() => {
       let bonus = 500 * S.wave, sub = '+' + bonus + ' clear bonus';
       if (S.player.hull >= S.waveHullStart) { bonus += 750; sub += ' · +750 untouched hull'; }
       if (!S.waveWingLost) { bonus += 500; sub += ' · +500 fleet intact'; }
-      S.score += bonus;
+      S.score += Math.round(bonus * (S.vanguard ? 1.5 : 1));
       S.events.push({ type: 'banner', text: 'WAVE ' + S.wave + ' CLEARED',
         sub: sub + ' — next wave warping in' });
       if (S.fleetLost.length) {
@@ -957,7 +1037,7 @@ const Destiny = (() => {
       S.otCleared = S.otWave;
       let bonus = 400 + 300 * S.otWave;
       if (!S.waveWingLost) bonus += 500;
-      S.score += bonus;
+      S.score += Math.round(bonus * (S.vanguard ? 1.5 : 1));
       S.events.push({ type: 'banner', text: 'OVERTIME WAVE ' + S.otWave + ' CLEARED',
         sub: '+' + bonus + ' — more incoming' });
       if (S.fleetLost.length) {
@@ -979,14 +1059,18 @@ const Destiny = (() => {
 
   function tick(cmd) {
     if (S.mode === 'intro') {
-      if (cmd.anyKey) {
-        S.mode = 'play'; S.waveDelay = 0.4; spawnFleet();
+      if (cmd.anyKey || cmd.restart) {
+        S.mode = 'play'; S.waveDelay = 0.4; S.vanguard = !!cmd.vanguard;
+        spawnFleet();
+        if (cmd.veteranDraft) offerDraft();   // service-record perk: fit before wave 1
         S.events.push({ type: 'warpin', x: S.player.x, y: S.player.y, ang: -Math.PI / 2, big: true, fc: true });
       }
       return;
     }
     if (cmd.restart) {
-      reset(); S.mode = 'play'; S.waveDelay = 0.4; spawnFleet();
+      reset(); S.mode = 'play'; S.waveDelay = 0.4; S.vanguard = !!cmd.vanguard;
+      spawnFleet();
+      if (cmd.veteranDraft) offerDraft();
       S.events.push({ type: 'warpin', x: S.player.x, y: S.player.y, ang: -Math.PI / 2, big: true, fc: true });
       return;
     }
@@ -1373,6 +1457,73 @@ const Trinity = (() => {
       x.moveTo(-0.5 * U, -0.75 * U); x.lineTo(-1.05 * U, -0.62 * U);
       x.stroke();
     }
+    else if (cls === 'dread') {
+      // the Execration: a cathedral of guns
+      const HULL = [[2.1, 0], [1.55, 0.3], [0.7, 0.42], [-0.3, 0.5], [-1.2, 0.55],
+                    [-1.8, 0.42], [-2.0, 0.18], [-2.0, -0.18], [-1.8, -0.42],
+                    [-1.2, -0.55], [-0.3, -0.5], [0.7, -0.42], [1.55, -0.3]];
+      x.save(); x.translate(0, U * 0.08);
+      poly(HULL); x.fillStyle = 'rgba(0,0,0,0.5)'; x.fill(); x.restore();
+      poly(HULL);
+      x.fillStyle = grad(-U * 0.6, U * 0.6, [[0, '#4a1e26'], [0.5, '#2a1015'], [1, '#150809']]);
+      x.fill();
+      x.strokeStyle = '#8c3a42'; x.lineWidth = U * 0.045; x.stroke();
+      // prow blades
+      x.fillStyle = '#6e2a32';
+      poly([[2.08, 0], [1.5, 0.14], [1.2, 0], [1.5, -0.14]]); x.fill();
+      poly([[1.5, 0.28], [0.95, 0.44], [0.9, 0.26]]); x.fill();
+      poly([[1.5, -0.28], [0.95, -0.44], [0.9, -0.26]]); x.fill();
+      // glowing spine
+      x.fillStyle = '#ff4b4b';
+      x.fillRect(-1.55 * U, -0.045 * U, 3.2 * U, 0.09 * U);
+      x.fillRect(-0.85 * U, -0.3 * U, 0.07 * U, 0.6 * U);
+      x.fillRect(0.25 * U, -0.3 * U, 0.07 * U, 0.6 * U);
+      // deck plates
+      x.strokeStyle = 'rgba(8,5,6,0.6)'; x.lineWidth = U * 0.03;
+      x.beginPath();
+      for (const xs of [1.35, 0.85, 0.3, -0.35, -0.95, -1.5]) {
+        x.moveTo(xs * U, -0.36 * U); x.lineTo(xs * U, 0.36 * U);
+      }
+      x.stroke();
+      // engine block
+      x.fillStyle = '#120a0e'; x.fillRect(-2.02 * U, -0.28 * U, 0.2 * U, 0.56 * U);
+      x.fillStyle = 'rgba(255,120,80,0.9)';
+      for (const sy of [-0.16, 0, 0.16]) {
+        x.beginPath(); x.ellipse(-2.0 * U, sy * U, 0.05 * U, 0.08 * U, 0, 0, TAU); x.fill();
+      }
+    }
+    else if (cls === 'subturret' || cls === 'subtorp' || cls === 'subgen') {
+      // hull-mounted subsystems: drawn riding the dreadnought
+      if (cls === 'subturret') {
+        x.strokeStyle = '#5a2a30'; x.lineWidth = U * 0.16;
+        x.beginPath();
+        for (const off of [-0.22, 0.22]) { x.moveTo(0.2 * U, off * U); x.lineTo(1.05 * U, off * U); }
+        x.stroke();
+        const gr2 = x.createRadialGradient(-U * 0.12, -U * 0.12, U * 0.05, 0, 0, U * 0.6);
+        gr2.addColorStop(0, '#8c4a52'); gr2.addColorStop(1, '#3c1a20');
+        x.fillStyle = gr2;
+        x.beginPath(); x.arc(0, 0, 0.55 * U, 0, TAU); x.fill();
+        x.strokeStyle = '#1c0d10'; x.lineWidth = U * 0.07; x.stroke();
+      } else if (cls === 'subtorp') {
+        x.fillStyle = '#3c1a20';
+        x.beginPath();
+        x.moveTo(-0.6 * U, -0.45 * U); x.lineTo(0.6 * U, -0.45 * U);
+        x.lineTo(0.75 * U, 0); x.lineTo(0.6 * U, 0.45 * U);
+        x.lineTo(-0.6 * U, 0.45 * U);
+        x.closePath(); x.fill();
+        x.strokeStyle = '#8c3a42'; x.lineWidth = U * 0.06; x.stroke();
+        x.fillStyle = '#ffb35a';
+        for (const oy of [-0.22, 0, 0.22]) {
+          x.beginPath(); x.arc(0.45 * U, oy * U, 0.09 * U, 0, TAU); x.fill();
+        }
+      } else {   // shield nexus: a glowing dome
+        const gr3 = x.createRadialGradient(0, 0, U * 0.05, 0, 0, U * 0.6);
+        gr3.addColorStop(0, '#ffe9f0'); gr3.addColorStop(0.4, '#e05a8a'); gr3.addColorStop(1, '#3c1a2a');
+        x.fillStyle = gr3;
+        x.beginPath(); x.arc(0, 0, 0.55 * U, 0, TAU); x.fill();
+        x.strokeStyle = '#ff8ab0'; x.lineWidth = U * 0.07; x.stroke();
+      }
+    }
     else if (cls === 'tackle' || cls === 'dps' || cls === 'logi' || cls === 'hlogi') {
       // wingmen fly Federation blue-grey; the enemy Mender is bone-and-rust
       const hostileLogi = cls === 'hlogi';
@@ -1449,7 +1600,11 @@ const Trinity = (() => {
     tackle: shipSprite('tackle', 25),
     dps: shipSprite('dps', 27),
     logi: shipSprite('logi', 30),
-    hlogi: shipSprite('hlogi', 29)
+    hlogi: shipSprite('hlogi', 29),
+    dread: shipSprite('dread', 58),
+    subturret: shipSprite('subturret', 16),
+    subtorp: shipSprite('subtorp', 16),
+    subgen: shipSprite('subgen', 15)
   };
   // the main battery: a pre-rendered triple-barrel turret, drawn live per slot
   const TURRET_SPR = (() => {
@@ -1762,8 +1917,21 @@ const Trinity = (() => {
     // hull ambient glow
     if (isPlayer) glow(x, y, rPx * 2.6, GLOW.blue, 0.10);
     else if (isFleet) glow(x, y, rPx * 2.1, GLOW.blue, 0.08);
-    else if (sh.cls === 'cruiser') glow(x, y, rPx * 2.6, GLOW.crimson, 0.16 + 0.05 * Math.sin(now * 2.2));
+    else if (sh.cls === 'cruiser' || sh.cls === 'dread') glow(x, y, rPx * 2.6, GLOW.crimson, 0.16 + 0.05 * Math.sin(now * 2.2));
     else glow(x, y, rPx * 2.1, GLOW.red, 0.09);
+    // the Nexus wraps the dreadnought in a visible shield bubble
+    if (sh.cls === 'dread' &&
+        S.ships.some(q => q.alive && q.cls === 'subgen' && q.parentId === sh.id)) {
+      const sR = rPx * 2.4;
+      g.beginPath(); g.arc(x, y, sR, 0, TAU);
+      g.strokeStyle = 'rgba(255,120,170,' + (0.25 + 0.12 * Math.sin(now * 3)).toFixed(2) + ')';
+      g.lineWidth = 2; g.stroke(); g.lineWidth = 1;
+      g.save();
+      g.beginPath(); g.arc(x, y, sR, 0, TAU); g.clip();
+      g.globalAlpha = 0.1 + 0.04 * Math.sin(now * 3);
+      g.drawImage(hexCv, x - sR, y - sR, sR * 2, sR * 2);
+      g.restore();
+    }
     g.globalCompositeOperation = 'source-over';
 
     // hull sprite
@@ -2477,9 +2645,10 @@ const Trinity = (() => {
           sctx.fillStyle = S.locked ? 'rgba(235,85,70,0.22)' : 'rgba(240,200,90,0.15)';
           sctx.fillRect(tx + 1, ry, tw - 2, 17);
         }
-        sctx.fillStyle = s.cls === 'cruiser' ? '#ff7d70' : s.cls === 'hlogi' ? '#8be0a8' : '#d8a0a0';
+        const big2 = s.cls === 'cruiser' || s.cls === 'dread';
+        sctx.fillStyle = big2 ? '#ff7d70' : s.cls === 'hlogi' ? '#8be0a8' : s.cls === 'subgen' ? '#ff8ab0' : '#d8a0a0';
         sctx.font = '11px Consolas,monospace'; sctx.textAlign = 'left';
-        sctx.fillText((s.cls === 'cruiser' ? '◆ ' : s.cls === 'hlogi' ? '✚ ' : '▲ ') + s.name, tx + 8, ry + 13);
+        sctx.fillText((big2 ? '◆ ' : s.cls === 'hlogi' ? '✚ ' : '▲ ') + s.name, tx + 8, ry + 13);
         sctx.fillStyle = '#8fa4b8'; sctx.textAlign = 'right';
         sctx.fillText(Math.round(Math.hypot(s.x - p.x, s.y - p.y)) + ' m', tx + tw - 8, ry + 13);
         overviewRows.push({ x: tx, y: ry, w: tw, h: 17, id: s.id });
@@ -2491,8 +2660,9 @@ const Trinity = (() => {
     const hudLine = (txt, col, font) => {
       sctx.fillStyle = col; sctx.font = font; sctx.fillText(txt, 16, ty2); ty2 += 16;
     };
-    hudLine(S.overtime ? 'OVERTIME — WAVE ' + S.otWave : 'WAVE ' + Math.min(S.wave, 3) + '/3',
-      '#8fa4b8', 'bold 12px Consolas,monospace');
+    hudLine((S.overtime ? 'OVERTIME — WAVE ' + S.otWave : 'WAVE ' + Math.min(S.wave, 4) + '/4')
+      + (S.vanguard ? '  ·  VANGUARD' : ''),
+      S.vanguard ? '#ffb35a' : '#8fa4b8', 'bold 12px Consolas,monospace');
     hudLine('SCORE ' + S.score.toLocaleString() + (best ? '   BEST ' + best.toLocaleString() : ''),
       '#ffd978', 'bold 12px Consolas,monospace');
     if (S.combo > 1 && S.comboT > 0)
@@ -2684,7 +2854,8 @@ const Trinity = (() => {
       if (!s.alive || s.faction !== 'hostile') continue;
       const [bx, by] = put(s.x, s.y);
       sctx.fillStyle = s.id === S.lockTargetId ? '#ffdf80' : s.cls === 'hlogi' ? '#8be0a8' : '#ff6a5a';
-      if (s.cls === 'cruiser') sctx.fillRect(bx - 3, by - 3, 6, 6);
+      if (s.cls === 'dread') sctx.fillRect(bx - 4, by - 4, 8, 8);
+      else if (s.cls === 'cruiser') sctx.fillRect(bx - 3, by - 3, 6, 6);
       else { sctx.beginPath(); sctx.arc(bx, by, 2.4, 0, TAU); sctx.fill(); }
     }
     for (const s of S.ships) {
@@ -2858,7 +3029,7 @@ const Trinity = (() => {
       ['3.', 'SPEED IS ARMOR — fast sideways motion', 'makes enemy turrets miss you.'],
       ['4.', 'Enemy MENDERS repair their fleet.', 'Always primary the logistics first.'],
       ['5.', 'Full capacitor? HOLD SPACE to charge', 'the WAVE MOTION GUN. It erases the lane.'],
-      ['6.', 'Survive 3 waves. Kill the cruiser', 'SANGUINE VESPER to secure the site.']
+      ['6.', 'Survive 4 waves. Break the dreadnought', 'EXECRATION to secure the site.']
     ];
     let yy = y2 + 48;
     for (const [n, a, b] of lines) {
@@ -3040,9 +3211,24 @@ const Trinity = (() => {
         sctx.save();
         sctx.shadowColor = 'rgba(255,200,90,0.9)'; sctx.shadowBlur = 14;
         sctx.fillStyle = '#ffe9b0'; sctx.font = 'bold 17px Consolas,monospace'; sctx.textAlign = 'center';
-        sctx.fillText('— press any key or tap to launch —', W / 2, Math.min(bottom + 40, H - 16));
+        sctx.fillText('— press any key or tap to launch —', W / 2, Math.min(bottom + 40, H - 42));
         sctx.restore();
       }
+      // service record + replay/vanguard hooks
+      const M2 = typeof Meta !== 'undefined' ? Meta : null;
+      const rec2 = M2 ? M2.get() : null;
+      sctx.textAlign = 'center'; sctx.font = '11px Consolas,monospace';
+      if (rec2 && (rec2.victories || rec2.totalKills)) {
+        sctx.fillStyle = '#7d93a8';
+        sctx.fillText('SERVICE RECORD — victories ' + rec2.victories + ' · kills ' + rec2.totalKills
+          + ' · best overtime ' + rec2.bestOT
+          + (M2.veteran() ? ' · pre-flight fitting UNLOCKED' : ''), W / 2, Math.min(bottom + 62, H - 24));
+      }
+      let hook = '[V] watch a replay code';
+      if (M2 && M2.unlocked())
+        hook += '   ·   [B] VANGUARD ' + (M2.vanguardOn() ? 'ARMED — +35% enemies, ×1.5 score' : 'available');
+      sctx.fillStyle = M2 && M2.vanguardOn() ? '#ffb35a' : 'rgba(140,165,190,0.8)';
+      sctx.fillText(hook, W / 2, Math.min(bottom + 78, H - 8));
     } else if (S.mode === 'play' && S.paused) {
       sctx.fillStyle = 'rgba(2,4,9,0.62)'; sctx.fillRect(0, 0, W, H);
       const ty = Math.max(80, H * 0.14);
@@ -3078,7 +3264,7 @@ const Trinity = (() => {
       sctx.fillStyle = '#f0c85a'; sctx.font = '13px Consolas,monospace';
       sctx.fillText(tip, W / 2, H * 0.4 + 56);
       sctx.fillStyle = '#eaf2fa'; sctx.font = 'bold 14px Consolas,monospace';
-      sctx.fillText('press R to refit and warp back', W / 2, H * 0.4 + 86);
+      sctx.fillText('press R to refit and warp back  ·  [C] copy replay code', W / 2, H * 0.4 + 86);
     } else if (S.mode === 'victory') {
       sctx.fillStyle = 'rgba(3,14,8,0.4)'; sctx.fillRect(0, 0, W, H);
       sctx.textAlign = 'center';
@@ -3089,8 +3275,9 @@ const Trinity = (() => {
       sctx.restore();
       const acc = S.stats.shots ? Math.round(100 * S.stats.hits / S.stats.shots) : 0;
       sctx.fillStyle = '#9cc8a0'; sctx.font = '13px Consolas,monospace';
-      sctx.fillText('The Sanguine Vesper is dust. ' + fmtTime(S.stats.endT) + ' · ' + S.kills + ' kills · ' + acc + '% turret accuracy', W / 2, H * 0.4 + 30);
-      const rating = S.stats.endT < 240 ? 'ELITE' : S.stats.endT < 380 ? 'VETERAN' : 'CAPSULEER';
+      sctx.fillText('The Execration is dust. ' + fmtTime(S.stats.endT) + ' · ' + S.kills + ' kills · ' + acc + '% turret accuracy'
+        + (S.vanguard ? ' · VANGUARD' : ''), W / 2, H * 0.4 + 30);
+      const rating = S.stats.endT < 360 ? 'ELITE' : S.stats.endT < 540 ? 'VETERAN' : 'CAPSULEER';
       sctx.save();
       sctx.shadowColor = 'rgba(255,215,120,0.8)'; sctx.shadowBlur = 16;
       sctx.fillStyle = '#ffd978'; sctx.font = 'bold 18px Consolas,monospace';
@@ -3105,7 +3292,7 @@ const Trinity = (() => {
       if (Math.floor(performance.now() / 500) % 2 === 0)
         sctx.fillText('press N for OVERTIME — endless reinforcements, keep your score', W / 2, H * 0.4 + 110);
       sctx.fillStyle = '#eaf2fa'; sctx.font = '13px Consolas,monospace';
-      sctx.fillText('or press R to fly the site again', W / 2, H * 0.4 + 134);
+      sctx.fillText('or press R to fly the site again  ·  [C] copy replay code', W / 2, H * 0.4 + 134);
     }
   }
 
@@ -3337,11 +3524,22 @@ const Trinity = (() => {
       sctx.fillRect(0, H - bh, W, bh);
     }
 
+    // replay badge
+    const RI = window.__replayInfo ? window.__replayInfo() : null;
+    if (RI && RI.active) {
+      sctx.save();
+      sctx.shadowColor = 'rgba(235,85,70,0.8)'; sctx.shadowBlur = 10;
+      sctx.fillStyle = '#ff7d70'; sctx.font = 'bold 14px Consolas,monospace'; sctx.textAlign = 'center';
+      sctx.fillText(RI.done ? '■ REPLAY ENDED — press R to take the helm' : '► REPLAY', W / 2, 24);
+      sctx.restore();
+    }
+
     overlay(S);
   }
 
   return {
     render,
+    note: t => { banner = { text: t, sub: null, life: 3 }; },
     screenToWorld: (x, y) => ({ x: (x - W / 2) / scale + cam.x, y: (y - H / 2) / scale + cam.y }),
     overviewHit: (x, y) => {
       for (const r of overviewRows)
@@ -3515,6 +3713,41 @@ const Aura = (() => {
 })();
 
 /* =====================================================================
+   META — service record, vanguard unlock, persistence (glue, not sim)
+   ===================================================================== */
+const Meta = (() => {
+  let meta = { victories: 0, totalKills: 0, bestOT: 0 };
+  try { meta = Object.assign(meta, JSON.parse(localStorage.getItem('cs_meta') || '{}')); } catch (e) {}
+  let vanguard = false;
+  try { vanguard = localStorage.getItem('cs_vanguard') === '1'; } catch (e) {}
+  let runLogged = false;
+  function frame(S) {
+    if ((S.mode === 'victory' || S.mode === 'dead') && !runLogged) {
+      runLogged = true;
+      meta.totalKills += S.kills;
+      if (S.mode === 'victory') meta.victories++;
+      if (S.otWave > meta.bestOT) meta.bestOT = S.otWave;
+      try { localStorage.setItem('cs_meta', JSON.stringify(meta)); } catch (e) {}
+    }
+    if (S.mode === 'play' || S.mode === 'intro') runLogged = false;
+  }
+  return {
+    frame,
+    get: () => meta,
+    unlocked: () => meta.victories > 0,
+    vanguardOn: () => vanguard && meta.victories > 0,
+    veteran: () => meta.bestOT >= 3,
+    toggleVanguard: () => {
+      if (meta.victories > 0) {
+        vanguard = !vanguard;
+        try { localStorage.setItem('cs_vanguard', vanguard ? '1' : '0'); } catch (e) {}
+      }
+      return vanguard && meta.victories > 0;
+    }
+  };
+})();
+
+/* =====================================================================
    Input + main loop (glue)
    ===================================================================== */
 const Input = (() => {
@@ -3530,6 +3763,13 @@ const Input = (() => {
     let k = e.key.toLowerCase();
     if (ALIAS[k]) k = ALIAS[k];
     if (k === 'p' || k === 'escape') { pause = true; return; }
+    if (k === 'c' || k === 'v' || k === 'b') {   // meta keys never launch the game
+      if (k === 'c' && window.__copyReplay) window.__copyReplay();
+      if (k === 'v' && window.__watchReplay) window.__watchReplay();
+      if (k === 'b' && Meta.unlocked())
+        Trinity.note('VANGUARD ' + (Meta.toggleVanguard() ? 'ARMED — +35% enemies, ×1.5 score' : 'STOOD DOWN'));
+      return;
+    }
     anyKey = true;
     held.add(k);
     if (e.key === 'Tab') tab = true;
@@ -3596,7 +3836,11 @@ const Input = (() => {
     if (held.has('d')) turn += 1;
     if (held.has('w')) fwd += 1;
     if (held.has('s')) fwd -= 1;
-    if (joy.id !== null && Math.hypot(joy.dx, joy.dy) > 12) { tx = joy.dx; ty = joy.dy; }
+    if (joy.id !== null && Math.hypot(joy.dx, joy.dy) > 12) {
+      // quantise the stick to 7.5° steps so replays run-length-encode well
+      const qa = Math.round(Math.atan2(joy.dy, joy.dx) / (Math.PI / 24)) * (Math.PI / 24);
+      tx = +Math.cos(qa).toFixed(3); ty = +Math.sin(qa).toFixed(3);
+    }
     const cmd = {
       thrustX: tx, thrustY: ty,
       turn, forward: fwd,
@@ -3608,6 +3852,8 @@ const Input = (() => {
       missile: missileKey,
       order: orderKey,
       pick: pickKey,
+      vanguard: Meta.vanguardOn(),
+      veteranDraft: Meta.veteran(),
       clickWorld: null, lockId: null
     };
     if (click) {
@@ -3628,17 +3874,141 @@ const Input = (() => {
 })();
 
 (function main() {
+  /* Replays: the sim is deterministic, so a whole battle is just the
+     run-length-encoded input stream. Record every run; export/import
+     as a compact code; play back by feeding the log to Destiny. */
+  const BOOLS = { ab: 1, wmg: 1, heat: 1, tab: 1, restart: 1, anyKey: 1, pause: 1, overtime: 1, missile: 1, vanguard: 1, veteranDraft: 1 };
+  const CMD_KEYS = ['thrustX', 'thrustY', 'turn', 'forward', 'ab', 'wmg', 'heat', 'tab', 'restart', 'anyKey', 'pause', 'overtime', 'missile', 'order', 'pick', 'clickWorld', 'lockId', 'vanguard', 'veteranDraft'];
+  function packCmd(c) {
+    return CMD_KEYS.map(k => {
+      const v = c[k];
+      return v === true ? 1 : (v === false || v == null) ? 0 : v;
+    });
+  }
+  function unpackCmd(a) {
+    const c = {};
+    CMD_KEYS.forEach((k, i) => {
+      let v = a[i];
+      if (BOOLS[k]) v = !!v;
+      else if ((k === 'order' || k === 'clickWorld' || k === 'lockId') && v === 0) v = null;
+      c[k] = v;
+    });
+    return c;
+  }
+
+  const Rec = { log: [], last: '' };
+  const Replay = { active: false, data: null, i: 0, j: 0, done: false };
+  let exitReplay = false;
+
+  function record(cmd, S) {
+    const starting = cmd.restart || (S.mode === 'intro' && cmd.anyKey);
+    if (starting) {
+      const p2 = packCmd(cmd);
+      Rec.log = [[1, p2]];
+      Rec.last = JSON.stringify(p2);
+      return;
+    }
+    if (!Rec.log.length || Rec.log.length > 400000) return;
+    if (S.mode !== 'play' && S.mode !== 'dead' && S.mode !== 'victory') return;
+    const p2 = packCmd(cmd);
+    const s2 = JSON.stringify(p2);
+    if (s2 === Rec.last) Rec.log[Rec.log.length - 1][0]++;
+    else { Rec.log.push([1, p2]); Rec.last = s2; }
+  }
+
+  function nextReplayCmd() {
+    if (exitReplay) {
+      exitReplay = false;
+      Replay.active = false;
+      const c = unpackCmd(packCmd({}));
+      c.restart = true;
+      c.vanguard = Meta.vanguardOn();
+      c.veteranDraft = Meta.veteran();
+      return c;
+    }
+    if (Replay.i >= Replay.data.length) { Replay.done = true; return null; }
+    const seg = Replay.data[Replay.i];
+    const c = unpackCmd(seg[1]);
+    if (Replay.i === 0 && Replay.j === 0) { c.restart = true; c.anyKey = false; }
+    if (++Replay.j >= seg[0]) { Replay.i++; Replay.j = 0; }
+    return c;
+  }
+
+  async function deflate(str) {
+    const cs = new CompressionStream('deflate-raw');
+    const ab = await new Response(new Blob([str]).stream().pipeThrough(cs)).arrayBuffer();
+    const u = new Uint8Array(ab);
+    let s = '';
+    for (let i = 0; i < u.length; i += 0x8000)
+      s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+  async function inflate(b64) {
+    const bin = atob(b64);
+    const u = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    const ds = new DecompressionStream('deflate-raw');
+    return await new Response(new Blob([u]).stream().pipeThrough(ds)).text();
+  }
+
+  window.__copyReplay = async function () {
+    const S = Destiny.state();
+    if (Replay.active || (S.mode !== 'victory' && S.mode !== 'dead') || Rec.log.length < 2) return;
+    const json = JSON.stringify(Rec.log);
+    let code;
+    try {
+      code = 'SBR2.' + await deflate(json);
+    } catch (e) {
+      code = 'SBR1.' + btoa(unescape(encodeURIComponent(json)));
+    }
+    const done = () => Trinity.note('REPLAY CODE COPIED (' + Math.max(1, Math.round(code.length / 1024)) + ' KB) — share the battle');
+    const fallback = () => { try { prompt('Copy your replay code:', code); } catch (e) {} };
+    if (navigator.clipboard && navigator.clipboard.writeText)
+      navigator.clipboard.writeText(code).then(done, fallback);
+    else fallback();
+  };
+  window.__watchReplay = async function () {
+    let code = '';
+    try { code = (prompt('Paste a replay code:') || '').trim(); } catch (e) {}
+    if (!code) return;
+    try {
+      let json;
+      if (code.indexOf('SBR2.') === 0) json = await inflate(code.slice(5));
+      else if (code.indexOf('SBR1.') === 0) json = decodeURIComponent(escape(atob(code.slice(5))));
+      else { Trinity.note('Not a valid replay code'); return; }
+      const data = JSON.parse(json);
+      if (!Array.isArray(data) || !data.length) throw new Error('empty');
+      Replay.active = true; Replay.data = data; Replay.i = 0; Replay.j = 0; Replay.done = false;
+      Trinity.note('REPLAY LOADED — press R to take the helm');
+    } catch (e) { Trinity.note('Replay code corrupted'); }
+  };
+  window.__replayInfo = () => ({ active: Replay.active, done: Replay.done });
+  window.__rp = { packCmd, unpackCmd, Rec, Replay, deflate, inflate };
+
   let last = performance.now() / 1000, acc = 0;
   function frame() {
     const now = performance.now() / 1000;
     acc += Math.min(now - last, 0.25);
     last = now;
     const evts = [];
+    if (Replay.active) {
+      const ic = Input.consume();   // only the exit key matters while spectating
+      if (ic.restart) exitReplay = true;
+    }
     while (acc >= TICK) {
-      Destiny.tick(Input.consume());
+      let cmd;
+      if (Replay.active) {
+        cmd = nextReplayCmd();
+        if (cmd === null) { acc = 0; break; }   // replay over: freeze the grid
+      } else {
+        cmd = Input.consume();
+        record(cmd, Destiny.state());
+      }
+      Destiny.tick(cmd);
       evts.push(...Destiny.drainEvents());
       acc -= TICK;
     }
+    Meta.frame(Destiny.state());
     Aura.handle(evts, Destiny.state());
     Aura.update(Destiny.state());
     Trinity.render(acc / TICK, evts);

@@ -52,8 +52,16 @@ step by step. **P** pauses and brings the control reference back at any time.
 - The cruiser's heavy turrets track slowly: get close and orbit fast to slip under her
   guns. Her **torpedoes** home in on you — outrun them with the afterburner or cut
   perpendicular at the last moment.
-- Clear all three waves — scouts, frigates, then the cruiser **Sanguine Vesper** and
-  escorts — to secure the site. **R** restarts.
+- Clear all four waves — scouts, frigates, the cruiser **Sanguine Vesper**, then the
+  dreadnought **EXECRATION**, whose turrets, torpedo bay, and shield nexus are
+  separately targetable and destructible. Break the nexus or her hull is untouchable.
+  **R** restarts.
+- **Replays**: the sim is deterministic, so a whole battle is just the input stream.
+  Press **C** on the end screen to copy a compact replay code; **V** on the title
+  screen to paste and watch any battle tick-for-tick.
+- **Service record & VANGUARD**: victories, kills, and best overtime persist. Your
+  first victory unlocks **B** — VANGUARD mode (+35% enemy strength, ×1.5 score), and
+  reaching overtime wave 3 unlocks a pre-flight fitting draft.
 
 ## License
 
