@@ -14,7 +14,7 @@
 <script>
 "use strict";
 /* =====================================================================
-   LEVIATHANS — a capital-class carrier duel  [build v3.2-armed-school]
+   LEVIATHANS — a capital-class carrier duel  [build v3.3-named-escorts]
    (companion piece to STAR BLAZERS: Carbon Skirmish — same DNA:
     a fixed-tick simulation that owns all state, a renderer that only
     reads it, and WebAudio synthesis for every sound. One file, no deps.)
@@ -123,7 +123,7 @@ const Sim = (() => {
       beamT: 0, beamN: 0,
       stage: 1, stage2T: 0,
       score: 0, perfect: false, newBest: false, record: loadRecord(),
-      frigates: [],
+      frigates: [], frigStance: 'screen', eFrigStance: 'screen', escortsHome: 0,
       tut: 0, tutT: 0, tutFly: 0, tutSkip: false, tutBroad: false, tutWMG: false
     };
     S.E.hull = S.E.hullMax = DIFF[di].ehull;
@@ -303,19 +303,49 @@ const Sim = (() => {
   function tickFrigate(fr) {
     if (fr.dead) return;
     const own = fr.side === 'P' ? S.P : S.E, foe = foeOf(own);
-    // hold station between our carrier and theirs — a screening picket
+    const stance = fr.side === 'P' ? S.frigStance : S.eFrigStance;
     const toFoe = Math.atan2(foe.y - own.y, foe.x - own.x);
     const perp = fr.i ? 1 : -1;
-    const stx = own.x + Math.cos(toFoe) * 300 - Math.sin(toFoe) * perp * 190;
-    const sty = own.y + Math.sin(toFoe) * 300 + Math.cos(toFoe) * perp * 190;
+    let stx, sty, spdCap = 165;
+    if (stance === 'guard') {
+      // tuck in on the flanks; throw the hull in front of inbound torpedoes
+      stx = own.x - Math.sin(toFoe) * perp * 160 + Math.cos(toFoe) * 60;
+      sty = own.y + Math.cos(toFoe) * perp * 160 + Math.sin(toFoe) * 60;
+      let bt = null, btd = 900;
+      for (const pr of S.projectiles)
+        if (pr.kind === 'storp' && pr.side !== fr.side) {
+          const dd = dist(own.x, own.y, pr.x, pr.y);
+          if (dd < btd) { btd = dd; bt = pr; }
+        }
+      if (bt) { stx = (own.x + bt.x) / 2; sty = (own.y + bt.y) / 2; }
+      fr.hp = Math.min(fr.max, fr.hp + 6 * TICK);   // damage control while braced
+    } else if (stance === 'hunt') {
+      // charge the nearest enemy picket, or their carrier if none remain
+      let tgt = null, td = 1e9;
+      for (const g2 of S.frigates)
+        if (!g2.dead && g2.side !== fr.side) {
+          const dd = dist(fr.x, fr.y, g2.x, g2.y);
+          if (dd < td) { td = dd; tgt = g2; }
+        }
+      if (!tgt && !foe.dead) { tgt = foe; td = dist(fr.x, fr.y, foe.x, foe.y); }
+      if (tgt) {
+        const a2 = Math.atan2(tgt.y - fr.y, tgt.x - fr.x);
+        stx = tgt.x - Math.cos(a2) * 240; sty = tgt.y - Math.sin(a2) * 240;
+        spdCap = 185;
+      } else { stx = own.x + Math.cos(toFoe) * 300; sty = own.y + Math.sin(toFoe) * 300; }
+    } else {
+      // SCREEN: picket between our carrier and theirs
+      stx = own.x + Math.cos(toFoe) * 300 - Math.sin(toFoe) * perp * 190;
+      sty = own.y + Math.sin(toFoe) * 300 + Math.cos(toFoe) * perp * 190;
+    }
     const d2 = dist(fr.x, fr.y, stx, sty) || 1;
-    const spd = Math.min(165, d2 * 0.8);
+    const spd = Math.min(spdCap, d2 * 0.8);
     const k = 1 - Math.exp(-1.6 * TICK);
     fr.vx += ((stx - fr.x) / d2 * spd - fr.vx) * k;
     fr.vy += ((sty - fr.y) / d2 * spd - fr.vy) * k;
     fr.x += fr.vx * TICK; fr.y += fr.vy * TICK;
     fr.face = toFoe;
-    fr.gunCd -= TICK; fr.pdCd -= TICK;
+    fr.gunCd -= TICK * (stance === 'hunt' ? 1.3 : 1); fr.pdCd -= TICK;
     // light turret: duel enemy pickets first, then harass their carrier
     if (fr.gunCd <= 0 && !(fr.side === 'E' && tutHold())) {   // pickets honor flight school too
       let tv = null, bfd = 950;
@@ -705,7 +735,7 @@ const Sim = (() => {
   }
 
   // ---- the enemy admiral: a mirror who actually thinks ----
-  const tutHold = () => S.diffIdx === 0 && !S.tutSkip && S.tut < 7 && S.t < 110;
+  const tutHold = () => S.diffIdx === 0 && !S.tutSkip && S.tut < 8 && S.t < 110;
   function tickAI() {
     const E = S.E, P = S.P;
     if (E.dead) return;
@@ -742,6 +772,10 @@ const Sim = (() => {
     // target the player's soft spots: hangar first, always
     E.targetSub = !P.subs.hangar.disabled && P.subs.hangar.hp > 0 ? 'hangar'
       : !P.subs.weapons.disabled ? 'weapons' : 'shieldgen';
+    // escort doctrine: brace under torpedo fire, hunt when it smells blood
+    const torpIn = S.projectiles.some(pr => pr.kind === 'storp' && pr.side === 'P');
+    S.eFrigStance = (E.shield < E.shieldMax * 0.3 || torpIn) ? 'guard'
+      : P.hull < P.hullMax * 0.35 ? 'hunt' : 'screen';
     // capital fire
     fireBroadside(E);
     if (E.spinalCd <= 0 && R() < 0.6 * S.diff.aggro) fireSpinal(E);
@@ -801,6 +835,10 @@ const Sim = (() => {
         evt({ type: 'blip' });
       }
       if (cmd.setSub) { P.targetSub = cmd.setSub; evt({ type: 'blip' }); }
+      if (cmd.frigStance) {
+        S.frigStance = S.frigStance === 'screen' ? 'guard' : S.frigStance === 'guard' ? 'hunt' : 'screen';
+        evt({ type: 'order' });
+      }
       if (cmd.sel != null) { S.sel = cmd.sel; evt({ type: 'blip' }); }
       if (cmd.launch) launchSquad(P, S.sel === 3 ? 0 : S.sel) || (S.sel === 3 && (launchSquad(P, 1), launchSquad(P, 2)));
       if (cmd.order) orderSquad(P, S.sel, cmd.order);
@@ -881,13 +919,16 @@ const Sim = (() => {
     else if (S.tut === 2 && S.fighters.some(f => f.side === 'P' && f.role === 'BMB' && f.state !== 'docked')) S.tut = 3;
     else if (S.tut === 3 && S.fighters.some(f => f.side === 'P' && f.state === 'recall')) S.tut = 4;
     else if (S.tut === 4 && cmd.preset) S.tut = 5;
-    else if (S.tut === 5 && S.tutBroad) S.tut = 6;
-    else if (S.tut === 6 && S.tutWMG) S.tut = 7;
+    else if (S.tut === 5 && cmd.frigStance) S.tut = 6;
+    else if (S.tut === 6 && S.tutBroad) S.tut = 7;
+    else if (S.tut === 7 && S.tutWMG) S.tut = 8;
 
     if (S.winner && S.mode === 'play') {
       S.mode = 'end';
       const st = S.stats, won = S.winner === 'P';
-      const raw = st.dealt * 0.35 - st.taken * 0.3 + st.saved * 80 - st.lost * 120 + (won ? 1000 : 0);
+      S.escortsHome = S.frigates.filter(fr => fr.side === 'P' && !fr.dead).length;
+      const raw = st.dealt * 0.35 - st.taken * 0.3 + st.saved * 80 - st.lost * 120
+        + (won ? 1000 + S.escortsHome * 400 : 0);
       S.score = Math.max(0, Math.round(raw * [0.7, 1, 1.4][S.diffIdx]));
       S.perfect = won && st.lost === 0;
       const r = S.record;
@@ -1321,15 +1362,15 @@ const Render = (() => {
     sctx.fillStyle = col; sctx.fillRect(x, y, w * clamp(frac, 0, 1), h);
   }
   const rects = { subs: [], squads: [] };
-  let wingPrev = ['', '', ''], ticker = [], stage2Flash = 0;
+  let wingPrev = ['', '', ''], ticker = [], stage2Flash = 0, frigPrev = [false, false], stancePrev = '';
 
   function drawHUD(S, now) {
     sctx.textBaseline = 'alphabetic';
     const P = S.P, E = S.E;
     // ===== my ship (bottom-left) =====
-    const bx = 14, by = H - 168, bw = 250;
-    sctx.fillStyle = 'rgba(6,10,16,0.78)'; sctx.fillRect(bx, by, bw, 156);
-    sctx.strokeStyle = 'rgba(110,160,210,0.4)'; sctx.strokeRect(bx + 0.5, by + 0.5, bw, 156);
+    const bx = 14, by = H - 208, bw = 250;
+    sctx.fillStyle = 'rgba(6,10,16,0.78)'; sctx.fillRect(bx, by, bw, 196);
+    sctx.strokeStyle = 'rgba(110,160,210,0.4)'; sctx.strokeRect(bx + 0.5, by + 0.5, bw, 196);
     sctx.fillStyle = '#9fc0dd'; sctx.font = 'bold 11px Consolas,monospace'; sctx.textAlign = 'left';
     sctx.fillText('LEVIATHAN  —  your command', bx + 8, by + 15);
     bar(bx + 8, by + 22, bw - 16, 9, P.shield / P.shieldMax, 'rgba(95,170,255,0.9)');
@@ -1343,22 +1384,32 @@ const Render = (() => {
       sctx.fillText(Sim.SUBS[k].label + (sub.disabled ? ' OFFLINE' : ''), bx + 8, yy + 8);
       bar(bx + 118, yy, bw - 126, 8, sub.hp / sub.max, sub.disabled ? 'rgba(255,90,70,0.8)' : 'rgba(190,210,120,0.85)');
     });
+    // escorts: PIKE and SABRE, and their one-key stance
+    const pFrigs = S.frigates.filter(fr => fr.side === 'P');
+    pFrigs.forEach((fr, i) => {
+      const yy = by + 116 + i * 12;
+      sctx.fillStyle = fr.dead ? '#5a3a3a' : '#9fb4c8'; sctx.font = '9px Consolas,monospace';
+      sctx.fillText((i ? 'SABRE' : 'PIKE') + (fr.dead ? '  LOST' : ''), bx + 8, yy + 8);
+      if (!fr.dead) bar(bx + 118, yy, bw - 126, 8, fr.hp / fr.max, 'rgba(140,190,230,0.85)');
+    });
+    sctx.fillStyle = '#7fe0d8'; sctx.font = 'bold 9px Consolas,monospace';
+    sctx.fillText('[B] ESCORT STANCE: ' + S.frigStance.toUpperCase(), bx + 8, by + 148);
     // power pips
     sctx.fillStyle = '#9fc0dd'; sctx.font = 'bold 9px Consolas,monospace';
-    sctx.fillText('POWER  [Z]wpn [X]bal [C]shd [V]hgr', bx + 8, by + 122);
+    sctx.fillText('POWER  [Z]wpn [X]bal [C]shd [V]hgr', bx + 8, by + 162);
     ['shields', 'weapons', 'engines', 'hangar'].forEach((k, i) => {
       sctx.fillStyle = '#7d93a8'; sctx.font = '8px Consolas,monospace';
-      sctx.fillText(k.slice(0, 3).toUpperCase(), bx + 8 + i * 60, by + 136);
+      sctx.fillText(k.slice(0, 3).toUpperCase(), bx + 8 + i * 60, by + 176);
       for (let p2 = 0; p2 < 4; p2++) {
         sctx.fillStyle = p2 < P.power[k] ? '#ffd070' : 'rgba(60,66,74,0.8)';
-        sctx.fillRect(bx + 8 + i * 60 + 24 + p2 * 7, by + 129, 5, 8);
+        sctx.fillRect(bx + 8 + i * 60 + 24 + p2 * 7, by + 169, 5, 8);
       }
     });
     // weapons readout
     const canB = Sim.canBroadside(P) && !P.subs.weapons.disabled;
     sctx.font = 'bold 9px Consolas,monospace';
     sctx.fillStyle = P.broadCd <= 0 && canB ? '#8fe0a8' : '#7d93a8';
-    sctx.fillText('[LMB] BROADSIDE ' + (P.subs.weapons.disabled ? 'OFFLINE' : canB ? (P.broadCd <= 0 ? 'READY' : P.broadCd.toFixed(1)) : 'NO ARC — show your flank'), bx + 8, by + 152);
+    sctx.fillText('[LMB] BROADSIDE ' + (P.subs.weapons.disabled ? 'OFFLINE' : canB ? (P.broadCd <= 0 ? 'READY' : P.broadCd.toFixed(1)) : 'NO ARC — show your flank'), bx + 8, by + 192);
     // ===== the arsenal (bottom-center): every trigger aims at [TAB] target =====
     sctx.textAlign = 'center';
     const wmgP = P.wmg;
@@ -1485,6 +1536,21 @@ const Render = (() => {
         wingPrev[sq] = st2;
       }
     }
+    // escorts: names over the hulls, and their fates on the ticker
+    pFrigs.forEach((fr, i) => {
+      const nm = i ? 'SABRE' : 'PIKE';
+      if (!fr.dead) {
+        sctx.textAlign = 'center'; sctx.font = 'bold 8px Consolas,monospace';
+        sctx.fillStyle = 'rgba(159,208,255,0.85)';
+        sctx.fillText(nm, w2x(fr.x), w2y(fr.y) - 26);
+      }
+      if (frigPrev[i] && fr.dead) ticker.push({ txt: nm + ' IS GONE', life: 4 });
+      frigPrev[i] = !fr.dead;
+    });
+    if (stancePrev !== S.frigStance) {
+      if (stancePrev !== '') ticker.push({ txt: 'ESCORTS — ' + S.frigStance.toUpperCase(), life: 2.5 });
+      stancePrev = S.frigStance;
+    }
     ticker = ticker.filter(m => (m.life -= 0.016) > 0);
     if (ticker.length > 2) ticker.splice(0, ticker.length - 2);
     sctx.textAlign = 'left'; sctx.font = 'bold 10px Consolas,monospace';
@@ -1512,15 +1578,16 @@ const Render = (() => {
     if (P.shield <= 0) warn('SHIELDS DOWN', '#ffd070');
 
     // flight school (ENSIGN): gated steps while the enemy holds off
-    if (S.diffIdx === 0 && !S.tutSkip && S.tut < 7 && S.t < 110) {
+    if (S.diffIdx === 0 && !S.tutSkip && S.tut < 8 && S.t < 110) {
       const msgs = [
-        'FLIGHT SCHOOL 1/7 — fly the ship: [W] thrust · [A]/[D] turn   (the enemy is holding off)',
-        'FLIGHT SCHOOL 2/7 — press [L] to LAUNCH your selected wing from the hangar',
-        'FLIGHT SCHOOL 3/7 — press [2] then [L]: launch your BOMBERS — they strike the target on their own',
-        'FLIGHT SCHOOL 4/7 — press [R] to RECALL a wing — docked fighters repair and rearm',
-        'FLIGHT SCHOOL 5/7 — set a power preset: [Z] weapons · [X] balanced · [C] shields · [V] hangar',
-        'FLIGHT SCHOOL 6/7 — show your flank with [A]/[D], then [LMB]: fire a BROADSIDE at the enemy',
-        'FLIGHT SCHOOL 7/7 — hold [H] to 100%: the WAVE MOTION GUN fires down your bow. Aim the ship.'
+        'FLIGHT SCHOOL 1/8 — fly the ship: [W] thrust · [A]/[D] turn   (the enemy is holding off)',
+        'FLIGHT SCHOOL 2/8 — press [L] to LAUNCH your selected wing from the hangar',
+        'FLIGHT SCHOOL 3/8 — press [2] then [L]: launch your BOMBERS — they strike the target on their own',
+        'FLIGHT SCHOOL 4/8 — press [R] to RECALL a wing — docked fighters repair and rearm',
+        'FLIGHT SCHOOL 5/8 — set a power preset: [Z] weapons · [X] balanced · [C] shields · [V] hangar',
+        'FLIGHT SCHOOL 6/8 — press [B]: cycle PIKE and SABRE\'s stance — GUARD tucks them in as a torpedo screen',
+        'FLIGHT SCHOOL 7/8 — show your flank with [A]/[D], then [LMB]: fire a BROADSIDE at the enemy',
+        'FLIGHT SCHOOL 8/8 — hold [H] to 100%: the WAVE MOTION GUN fires down your bow. Aim the ship.'
       ];
       sctx.textAlign = 'center';
       sctx.fillStyle = 'rgba(7,12,20,0.85)';
@@ -1530,7 +1597,7 @@ const Render = (() => {
       sctx.fillText(msgs[S.tut], W / 2, 146);
       sctx.fillStyle = '#7d93a8'; sctx.font = '10px Consolas,monospace';
       sctx.fillText('[ESC] skip flight school', W / 2, 164);
-    } else if (S.diffIdx === 0 && S.tut === 7 && S.t < 113) {
+    } else if (S.diffIdx === 0 && S.tut === 8 && S.t < 113) {
       sctx.textAlign = 'center';
       sctx.fillStyle = '#8fe0a8'; sctx.font = 'bold 13px Consolas,monospace';
       sctx.fillText('FLIGHT SCHOOL COMPLETE — the enemy is committing. Good hunting, admiral.', W / 2, 147);
@@ -1660,6 +1727,10 @@ const Render = (() => {
       if (won && st.lost === 0) {
         sctx.fillStyle = '#ffd978'; sctx.font = 'bold 13px Consolas,monospace';
         sctx.fillText('★ NOT ONE PILOT LEFT BEHIND ★', W / 2, ey2); ey2 += 20;
+      }
+      if (won && S.escortsHome === 2) {
+        sctx.fillStyle = '#9fd0ff'; sctx.font = 'bold 13px Consolas,monospace';
+        sctx.fillText('PIKE AND SABRE CAME HOME', W / 2, ey2); ey2 += 20;
       }
       const nr = Sim.nextRank(S.record.best);
       sctx.fillStyle = '#8fa4b8'; sctx.font = '11px Consolas,monospace';
@@ -1942,7 +2013,7 @@ const Input = (() => {
   const held = new Set();
   let launch = false, order = null, sel = null, cycleSub = false, preset = null,
       broadside = false, spinal = false, missile = false, pause = false, restart = false, start = null,
-      setSub = null, skipTut = false;
+      setSub = null, skipTut = false, frigStance = false;
   window.addEventListener('keydown', e => {
     Audio2.ensure();
     if ([' ', 'Tab'].includes(e.key) || e.key.startsWith('Arrow')) e.preventDefault();
@@ -1970,6 +2041,7 @@ const Input = (() => {
     if (k === 'p') pause = true;
     if (k === 'enter') restart = true;
     if (k === 'escape') skipTut = true;
+    if (k === 'b') frigStance = true;
   });
   window.addEventListener('keyup', e => held.delete(e.key.toLowerCase()));
   window.addEventListener('blur', () => held.clear());
@@ -1994,10 +2066,10 @@ const Input = (() => {
       thrust: (held.has('w') ? 1 : 0) + (held.has('s') ? -0.6 : 0),
       turn: (held.has('a') ? -1 : 0) + (held.has('d') ? 1 : 0),
       launch, order, sel, cycleSub, setSub, preset,
-      broadside, spinal, missile, wmgHold: held.has('h'), pause, restart, start, skipTut
+      broadside, spinal, missile, wmgHold: held.has('h'), pause, restart, start, skipTut, frigStance
     };
     launch = false; order = null; sel = null; cycleSub = false; setSub = null;
-    preset = null; broadside = false; spinal = false; missile = false; pause = false; restart = false; start = null; skipTut = false;
+    preset = null; broadside = false; spinal = false; missile = false; pause = false; restart = false; start = null; skipTut = false; frigStance = false;
     return cmd;
   }
   return { consume };
