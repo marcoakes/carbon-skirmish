@@ -729,6 +729,90 @@ const Render = (() => {
   const GLOW = { blue: mkGlow(110, 190, 255), red: mkGlow(255, 95, 70), gold: mkGlow(255, 210, 120), white: mkGlow(230, 240, 255), teal: mkGlow(90, 255, 210), orange: mkGlow(255, 160, 70) };
   const glow = (x, y, r, img, a) => { if (a <= 0 || r <= 0) return; g.globalAlpha = Math.min(1, a); g.drawImage(img, x - r, y - r, r * 2, r * 2); g.globalAlpha = 1; };
 
+  // ---- fighter sprites: one silhouette per role per side, built once ----
+  function buildFighterSprite(role, side) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const x = c.getContext('2d');
+    x.translate(32, 32);
+    const P = side === 'P';
+    const hull = P ? '#aebdcd' : '#4a4f57';
+    const dark = P ? '#5d7a99' : '#2a2d33';
+    const line = P ? '#31435a' : '#15171b';
+    const glowc = P ? '#7fd0ff' : '#ff5a4a';
+
+    if (role === 'INT') {
+      // TIE-style: ball cockpit between two ribbed solar panels
+      for (const sy of [-1, 1]) {
+        const py = sy > 0 ? 12 : -26;              // panel top edge
+        x.fillStyle = dark; x.fillRect(-13, py, 26, 14);
+        x.strokeStyle = line; x.lineWidth = 1.5; x.strokeRect(-13, py, 26, 14);
+        x.beginPath();                              // panel ribs + center bar
+        for (const px of [-6.5, 0, 6.5]) { x.moveTo(px, py); x.lineTo(px, py + 14); }
+        x.moveTo(-13, py + 7); x.lineTo(13, py + 7);
+        x.stroke();
+        x.strokeStyle = hull; x.lineWidth = 2;      // wing strut
+        x.beginPath(); x.moveTo(0, sy * 6); x.lineTo(0, sy * 12); x.stroke();
+      }
+      const g2 = x.createRadialGradient(-2, -2, 1, 0, 0, 8);
+      g2.addColorStop(0, hull); g2.addColorStop(1, dark);
+      x.fillStyle = g2; x.beginPath(); x.arc(0, 0, 7.5, 0, TAU); x.fill();
+      x.strokeStyle = line; x.lineWidth = 1.5; x.stroke();
+      x.fillStyle = glowc;                          // forward viewport
+      x.beginPath(); x.arc(3.5, 0, 3, 0, TAU); x.fill();
+    } else if (role === 'BMB') {
+      // TIE-bomber-style: cockpit pod + ordnance pod, angled panels outboard
+      for (const sy of [-1, 1]) {
+        x.fillStyle = dark;
+        x.beginPath();
+        x.moveTo(-12, sy * 11); x.lineTo(12, sy * 11);
+        x.lineTo(8, sy * 21); x.lineTo(-8, sy * 21);
+        x.closePath(); x.fill();
+        x.strokeStyle = line; x.lineWidth = 1.5; x.stroke();
+        x.beginPath();
+        x.moveTo(0, sy * 11); x.lineTo(0, sy * 21);
+        x.moveTo(-10, sy * 16); x.lineTo(10, sy * 16);
+        x.stroke();
+      }
+      x.fillStyle = hull; x.fillRect(-14, 1, 28, 9);      // ordnance hull
+      x.strokeStyle = line; x.lineWidth = 1.5; x.strokeRect(-14, 1, 28, 9);
+      x.fillStyle = P ? '#ffd070' : '#ff8a5a';            // bay stripe
+      x.fillRect(-10, 4.5, 20, 2);
+      x.fillStyle = hull; x.fillRect(-12, -10, 26, 9);    // cockpit hull
+      x.strokeStyle = line; x.strokeRect(-12, -10, 26, 9);
+      x.fillStyle = glowc;                                // canopy
+      x.beginPath(); x.arc(10, -5.5, 3, 0, TAU); x.fill();
+    } else {
+      // DEF — Viper-style: sleek dart, swept wings, tri-engine cluster, nose stripe
+      x.fillStyle = hull;
+      x.beginPath();
+      x.moveTo(17, 0); x.lineTo(2, 4); x.lineTo(-12, 5.5);
+      x.lineTo(-12, -5.5); x.lineTo(2, -4);
+      x.closePath(); x.fill();
+      x.strokeStyle = line; x.lineWidth = 1.5; x.stroke();
+      for (const sy of [-1, 1]) {
+        x.fillStyle = dark;
+        x.beginPath();
+        x.moveTo(2, sy * 4); x.lineTo(-13, sy * 14); x.lineTo(-12, sy * 5);
+        x.closePath(); x.fill();
+        x.strokeStyle = line; x.stroke();
+      }
+      x.fillStyle = dark; x.fillRect(-12, -1.5, 10, 3);   // dorsal spine
+      x.fillStyle = '#0d1116'; x.fillRect(-15, -6, 4, 12); // engine block
+      x.fillStyle = glowc;
+      for (const ey of [-3.8, 0, 3.8]) { x.beginPath(); x.arc(-14.5, ey, 1.6, 0, TAU); x.fill(); }
+      x.fillStyle = P ? '#e8734a' : '#8a2f2f';            // the Viper stripe
+      x.beginPath(); x.moveTo(17, 0); x.lineTo(8, 1.6); x.lineTo(8, -1.6); x.closePath(); x.fill();
+      x.fillStyle = glowc;                                // canopy
+      x.beginPath(); x.ellipse(6, 0, 4, 1.8, 0, 0, TAU); x.fill();
+    }
+    return c;
+  }
+  const FSPR = {};
+  for (const r of ['INT', 'BMB', 'DEF'])
+    for (const s of ['P', 'E'])
+      FSPR[r + s] = buildFighterSprite(r, s);
+
   // starfield + nebulae
   const stars = [];
   { let s = 1234321; const rnd = () => (s = s * 16807 % 2147483647) / 2147483647;
@@ -912,13 +996,10 @@ const Render = (() => {
     g.lineTo(x - f.vx * 0.06 * scale, y - f.vy * 0.06 * scale); g.stroke();
     glow(x, y, s * 1.5, f.side === 'P' ? GLOW.blue : GLOW.red, 0.3);
     g.globalCompositeOperation = 'source-over';
+    const spr = FSPR[f.role + f.side];
+    const ds = Math.max(18, s * 3.4);
     g.save(); g.translate(x, y); g.rotate(f.face);
-    g.fillStyle = f.side === 'P'
-      ? (f.role === 'BMB' ? '#7fa8cc' : f.role === 'DEF' ? '#9fc8e8' : '#c8e2f8')
-      : (f.role === 'BMB' ? '#b85a50' : '#e07a66');
-    g.beginPath();
-    g.moveTo(s, 0); g.lineTo(-s * 0.7, s * 0.55); g.lineTo(-s * 0.35, 0); g.lineTo(-s * 0.7, -s * 0.55);
-    g.closePath(); g.fill();
+    g.drawImage(spr, -ds / 2, -ds / 2, ds, ds);
     g.restore();
     // hp sliver
     if (f.hp < f.max) {
