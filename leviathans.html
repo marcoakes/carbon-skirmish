@@ -14,7 +14,7 @@
 <script>
 "use strict";
 /* =====================================================================
-   LEVIATHANS — a capital-class carrier duel  [build v3.3-named-escorts]
+   LEVIATHANS — a capital-class carrier duel  [build v3.4-gunnery-school]
    (companion piece to STAR BLAZERS: Carbon Skirmish — same DNA:
     a fixed-tick simulation that owns all state, a renderer that only
     reads it, and WebAudio synthesis for every sound. One file, no deps.)
@@ -118,13 +118,13 @@ const Sim = (() => {
       fighters: [], projectiles: [], events: [],
       sel: 0,                              // selected squadron (0..2), 3 = all
       aiThinkT: 0, aiRecallT: 0,
-      stats: { lost: 0, saved: 0, dealt: 0, taken: 0, sorties: 0 },
+      stats: { lost: 0, saved: 0, dealt: 0, taken: 0, sorties: 0, broadsides: 0 },
       paused: false, winner: null, endT: 0,
       beamT: 0, beamN: 0,
       stage: 1, stage2T: 0,
       score: 0, perfect: false, newBest: false, record: loadRecord(),
       frigates: [], frigStance: 'screen', eFrigStance: 'screen', escortsHome: 0,
-      tut: 0, tutT: 0, tutFly: 0, tutSkip: false, tutBroad: false, tutWMG: false
+      tut: 0, tutT: 0, tutFly: 0, tutSkip: false, tutBroad: false, tutWMG: false, tutTorp: false, tutArcT: 0
     };
     S.E.hull = S.E.hullMax = DIFF[di].ehull;
     for (let sq = 0; sq < 3; sq++) {
@@ -646,7 +646,7 @@ const Sim = (() => {
     if (Math.abs(Math.abs(rel) - Math.PI / 2) > 0.95) return false;   // must present the flank
     if (dist(c.x, c.y, foe.x, foe.y) > 1500) return false;
     c.broadCd = 2.6 / pw(c, 'weapons') / (c.side === 'E' ? S.diff.aggro : 1);
-    if (c === S.P) S.tutBroad = true;
+    if (c === S.P) { S.tutBroad = true; S.stats.broadsides++; }
     const ca = Math.cos(c.face), sa = Math.sin(c.face);
     // gunnery lead: aim where the target will be when the shells arrive
     const tof = dist(c.x, c.y, foe.x, foe.y) / 620;
@@ -669,6 +669,7 @@ const Sim = (() => {
     const foe = foeOf(c);
     if (dist(c.x, c.y, foe.x, foe.y) > 2100) return false;
     c.spinalCd = 16;
+    if (c === S.P) S.tutTorp = true;
     for (let i = 0; i < 3; i++) {
       const a = c.face + (i - 1) * 0.14;
       S.projectiles.push({
@@ -735,7 +736,7 @@ const Sim = (() => {
   }
 
   // ---- the enemy admiral: a mirror who actually thinks ----
-  const tutHold = () => S.diffIdx === 0 && !S.tutSkip && S.tut < 8 && S.t < 110;
+  const tutHold = () => S.diffIdx === 0 && !S.tutSkip && S.tut < 10 && S.t < 130;
   function tickAI() {
     const E = S.E, P = S.P;
     if (E.dead) return;
@@ -842,12 +843,24 @@ const Sim = (() => {
       if (cmd.sel != null) { S.sel = cmd.sel; evt({ type: 'blip' }); }
       if (cmd.launch) launchSquad(P, S.sel === 3 ? 0 : S.sel) || (S.sel === 3 && (launchSquad(P, 1), launchSquad(P, 2)));
       if (cmd.order) orderSquad(P, S.sel, cmd.order);
-      if (cmd.broadside) fireBroadside(P);
-      if (cmd.spinal) fireSpinal(P);
-      if (cmd.missile) fireMissiles(P);
+      // fire commands never fail silently: say why, in plain words
+      if (cmd.broadside && !fireBroadside(P)) evt({ type: 'dryfire', why:
+        P.subs.weapons.disabled ? 'weapons array offline'
+        : P.broadCd > 0 ? 'broadside reloading'
+        : dist(P.x, P.y, S.E.x, S.E.y) > 1500 ? 'broadside out of range — close in'
+        : 'no arc — turn until the enemy is in a side wedge' });
+      if (cmd.spinal && !fireSpinal(P)) evt({ type: 'dryfire', why:
+        P.subs.weapons.disabled ? 'weapons array offline'
+        : P.spinalCd > 0 ? 'torpedoes reloading'
+        : 'torpedoes out of range — close in' });
+      if (cmd.missile && !fireMissiles(P)) evt({ type: 'dryfire', why:
+        P.subs.weapons.disabled ? 'weapons array offline' : 'missiles reloading' });
       // WAVE MOTION GUN: hold [H] — the ship braces, energy gathers, judgment
       const wm = P.wmg;
       wm.cd = Math.max(0, wm.cd - TICK);
+      if (cmd.wmgHold && (wm.cd > 0 || P.subs.weapons.disabled)) {
+        if (!wm.warned) { wm.warned = true; evt({ type: 'dryfire', why: P.subs.weapons.disabled ? 'weapons array offline' : 'wave motion gun recharging' }); }
+      } else if (!cmd.wmgHold) wm.warned = false;
       if (cmd.wmgHold && wm.cd <= 0 && !P.subs.weapons.disabled) {
         if (!wm.charging) { wm.charging = true; wm.charge = 0; evt({ type: 'wmgcharge' }); }
         wm.charge += TICK / 2.2;
@@ -918,10 +931,17 @@ const Sim = (() => {
     else if (S.tut === 1 && S.stats.sorties > 0) S.tut = 2;
     else if (S.tut === 2 && S.fighters.some(f => f.side === 'P' && f.role === 'BMB' && f.state !== 'docked')) S.tut = 3;
     else if (S.tut === 3 && S.fighters.some(f => f.side === 'P' && f.state === 'recall')) S.tut = 4;
-    else if (S.tut === 4 && cmd.preset) S.tut = 5;
-    else if (S.tut === 5 && cmd.frigStance) S.tut = 6;
-    else if (S.tut === 6 && S.tutBroad) S.tut = 7;
-    else if (S.tut === 7 && S.tutWMG) S.tut = 8;
+    else if (S.tut === 4 && cmd.frigStance) S.tut = 5;
+    else if (S.tut === 5 && (cmd.cycleSub || cmd.setSub)) S.tut = 6;
+    else if (S.tut === 6) {   // hold the enemy in a broadside wedge for a full second
+      const rel = wrapA(Math.atan2(S.E.y - P.y, S.E.x - P.x) - P.face);
+      const arced = Math.abs(Math.abs(rel) - Math.PI / 2) <= 0.95 && dist(P.x, P.y, S.E.x, S.E.y) <= 1500;
+      S.tutArcT = arced ? S.tutArcT + 1 : 0;
+      if (S.tutArcT >= 60) S.tut = 7;
+    }
+    else if (S.tut === 7 && S.tutBroad) S.tut = 8;
+    else if (S.tut === 8 && S.tutTorp) S.tut = 9;
+    else if (S.tut === 9 && S.tutWMG) S.tut = 10;
 
     if (S.winner && S.mode === 'play') {
       S.mode = 'end';
@@ -1264,6 +1284,7 @@ const Render = (() => {
         case 'fighterdown': if (e.side === 'P') redF = Math.min(0.5, redF + 0.18); break;
         case 'frigatedown': boom(e.x, e.y, 26, true); if (e.side === 'P') redF = Math.min(0.5, redF + 0.25); break;
         case 'stage2': flashes.push({ x: e.x, y: e.y, r: 280, life: 0.5, max: 0.5, img: GLOW.red }); shake = Math.min(26, shake + 14); stage2Flash = 4.5; break;
+        case 'dryfire': dryToast = { txt: e.why.toUpperCase(), life: 1.6 }; break;
       }
     }
   }
@@ -1362,7 +1383,7 @@ const Render = (() => {
     sctx.fillStyle = col; sctx.fillRect(x, y, w * clamp(frac, 0, 1), h);
   }
   const rects = { subs: [], squads: [] };
-  let wingPrev = ['', '', ''], ticker = [], stage2Flash = 0, frigPrev = [false, false], stancePrev = '';
+  let wingPrev = ['', '', ''], ticker = [], stage2Flash = 0, frigPrev = [false, false], stancePrev = '', dryToast = null;
 
   function drawHUD(S, now) {
     sctx.textBaseline = 'alphabetic';
@@ -1409,20 +1430,50 @@ const Render = (() => {
     const canB = Sim.canBroadside(P) && !P.subs.weapons.disabled;
     sctx.font = 'bold 9px Consolas,monospace';
     sctx.fillStyle = P.broadCd <= 0 && canB ? '#8fe0a8' : '#7d93a8';
-    sctx.fillText('[LMB] BROADSIDE ' + (P.subs.weapons.disabled ? 'OFFLINE' : canB ? (P.broadCd <= 0 ? 'READY' : P.broadCd.toFixed(1)) : 'NO ARC — show your flank'), bx + 8, by + 192);
-    // ===== the arsenal (bottom-center): every trigger aims at [TAB] target =====
-    sctx.textAlign = 'center';
+    sctx.fillText('BROADSIDE ' + (P.subs.weapons.disabled ? 'OFFLINE' : canB ? (P.broadCd <= 0 ? 'READY' : P.broadCd.toFixed(1) + 's') : 'NO ARC — get the enemy in a wedge'), bx + 8, by + 192);
+    // ===== weapons card (bottom-center): every trigger, in plain words =====
     const wmgP = P.wmg;
-    const wmgTxt = P.subs.weapons.disabled ? 'OFFLINE'
-      : wmgP.charging ? 'CHARGING ' + Math.round(wmgP.charge * 100) + '%'
-      : wmgP.cd > 0 ? Math.ceil(wmgP.cd) + 's' : 'READY';
-    sctx.fillStyle = wmgP.charging ? '#bfe9ff' : wmgP.cd <= 0 ? '#8fe0a8' : '#7d93a8';
-    sctx.font = 'bold 10px Consolas,monospace';
-    sctx.fillText('[hold H] WAVE MOTION GUN ' + wmgTxt + '   ·   [T/RMB] MISSILES '
-      + (P.missCd <= 0 ? 'READY' : Math.ceil(P.missCd) + 's') + '   ·   [SPACE] SPINAL '
-      + (P.spinalCd <= 0 ? 'READY' : Math.ceil(P.spinalCd) + 's'), W / 2, H - 24);
-    sctx.fillStyle = '#7fe0d8';
-    sctx.fillText('target →  ' + Sim.SUBS[P.targetSub].label + '   ([TAB] or click the enemy panel to retarget)', W / 2, H - 10);
+    const wOff = P.subs.weapons.disabled;
+    const canB2 = Sim.canBroadside(P) && !wOff;
+    const wrows = [
+      ['BROADSIDE', 'LEFT CLICK',
+        wOff ? ['OFFLINE', '#ff6a5a'] : !canB2 ? ['NO ARC', '#ffb35a'] : P.broadCd > 0 ? ['RELOAD ' + Math.ceil(P.broadCd) + 's', '#7d93a8'] : ['READY', '#8fe0a8'],
+        'side guns — put the enemy in a green wedge'],
+      ['TORPEDOES', 'SPACE',
+        wOff ? ['OFFLINE', '#ff6a5a'] : P.spinalCd > 0 ? ['RELOAD ' + Math.ceil(P.spinalCd) + 's', '#7d93a8'] : ['READY', '#8fe0a8'],
+        'slow, home on your target, can be shot down'],
+      ['MISSILES', 'T / R.CLICK',
+        wOff ? ['OFFLINE', '#ff6a5a'] : P.missCd > 0 ? ['RELOAD ' + Math.ceil(P.missCd) + 's', '#7d93a8'] : ['READY', '#8fe0a8'],
+        '8 birds — half chase fighters, half your target'],
+      ['WAVE GUN', 'HOLD H',
+        wOff ? ['OFFLINE', '#ff6a5a'] : wmgP.charging ? ['CHARGE ' + Math.round(wmgP.charge * 100) + '%', '#bfe9ff'] : wmgP.cd > 0 ? ['RECHARGE ' + Math.ceil(wmgP.cd) + 's', '#7d93a8'] : ['READY', '#8fe0a8'],
+        'charge 2s — erases everything ahead of the bow']
+    ];
+    const wcx = W / 2 - 245, wcy = H - 102, wcw = 490;
+    sctx.fillStyle = 'rgba(6,10,16,0.78)'; sctx.fillRect(wcx, wcy, wcw, 92);
+    sctx.strokeStyle = 'rgba(110,160,210,0.4)'; sctx.strokeRect(wcx + 0.5, wcy + 0.5, wcw, 92);
+    sctx.textAlign = 'left';
+    wrows.forEach((r2, i) => {
+      const yy = wcy + 15 + i * 14;
+      sctx.font = 'bold 9px Consolas,monospace';
+      sctx.fillStyle = '#9fc0dd'; sctx.fillText(r2[0], wcx + 8, yy);
+      sctx.fillStyle = '#d7e3ef'; sctx.fillText(r2[1], wcx + 74, yy);
+      sctx.fillStyle = r2[2][1]; sctx.fillText(r2[2][0], wcx + 148, yy);
+      sctx.font = '8px Consolas,monospace';
+      sctx.fillStyle = 'rgba(135,157,178,0.95)'; sctx.fillText(r2[3], wcx + 244, yy);
+    });
+    sctx.textAlign = 'center';
+    sctx.fillStyle = '#7fe0d8'; sctx.font = 'bold 10px Consolas,monospace';
+    sctx.fillText('everything aims at →  ' + Sim.SUBS[P.targetSub].label + '   ([TAB] or click the enemy panel to change)', W / 2, wcy + 84);
+    if (dryToast) {
+      dryToast.life -= 0.016;
+      if (dryToast.life <= 0) dryToast = null;
+      else {
+        sctx.fillStyle = 'rgba(255,179,90,' + Math.min(1, dryToast.life * 2).toFixed(2) + ')';
+        sctx.font = 'bold 11px Consolas,monospace';
+        sctx.fillText('✕ ' + dryToast.txt, W / 2, wcy - 8);
+      }
+    }
     if (wmgP.charging) {
       sctx.save();
       sctx.shadowColor = 'rgba(140,220,255,0.9)'; sctx.shadowBlur = 20;
@@ -1578,26 +1629,28 @@ const Render = (() => {
     if (P.shield <= 0) warn('SHIELDS DOWN', '#ffd070');
 
     // flight school (ENSIGN): gated steps while the enemy holds off
-    if (S.diffIdx === 0 && !S.tutSkip && S.tut < 8 && S.t < 110) {
+    if (S.diffIdx === 0 && !S.tutSkip && S.tut < 10 && S.t < 130) {
       const msgs = [
-        'FLIGHT SCHOOL 1/8 — fly the ship: [W] thrust · [A]/[D] turn   (the enemy is holding off)',
-        'FLIGHT SCHOOL 2/8 — press [L] to LAUNCH your selected wing from the hangar',
-        'FLIGHT SCHOOL 3/8 — press [2] then [L]: launch your BOMBERS — they strike the target on their own',
-        'FLIGHT SCHOOL 4/8 — press [R] to RECALL a wing — docked fighters repair and rearm',
-        'FLIGHT SCHOOL 5/8 — set a power preset: [Z] weapons · [X] balanced · [C] shields · [V] hangar',
-        'FLIGHT SCHOOL 6/8 — press [B]: cycle PIKE and SABRE\'s stance — GUARD tucks them in as a torpedo screen',
-        'FLIGHT SCHOOL 7/8 — show your flank with [A]/[D], then [LMB]: fire a BROADSIDE at the enemy',
-        'FLIGHT SCHOOL 8/8 — hold [H] to 100%: the WAVE MOTION GUN fires down your bow. Aim the ship.'
+        'FLIGHT SCHOOL 1/5 — fly the ship: [W] thrust · [A]/[D] turn   (the enemy is holding off)',
+        'FLIGHT SCHOOL 2/5 — press [L] to LAUNCH your selected wing from the hangar',
+        'FLIGHT SCHOOL 3/5 — press [2] then [L]: launch your BOMBERS — they strike the target on their own',
+        'FLIGHT SCHOOL 4/5 — press [R] to RECALL a wing — docked fighters repair and rearm',
+        'FLIGHT SCHOOL 5/5 — press [B]: cycle PIKE and SABRE\'s stance — GUARD tucks them in as a torpedo screen',
+        'GUNNERY SCHOOL 1/5 — press [TAB]: pick which enemy subsystem ALL your weapons aim at',
+        'GUNNERY SCHOOL 2/5 — your guns fire from the SIDES: turn [A]/[D] until the wedge over the enemy glows GREEN',
+        'GUNNERY SCHOOL 3/5 — LEFT CLICK: fire the broadside',
+        'GUNNERY SCHOOL 4/5 — press [SPACE]: torpedoes away — watch them chase your target ([T] = missiles)',
+        'GUNNERY SCHOOL 5/5 — hold [H] to 100%: the WAVE MOTION GUN erases everything ahead of the bow'
       ];
       sctx.textAlign = 'center';
       sctx.fillStyle = 'rgba(7,12,20,0.85)';
-      const tw = 640; sctx.fillRect(W / 2 - tw / 2, 128, tw, 44);
+      const tw = 700; sctx.fillRect(W / 2 - tw / 2, 128, tw, 44);
       sctx.strokeStyle = 'rgba(120,180,255,0.5)'; sctx.strokeRect(W / 2 - tw / 2 + 0.5, 128.5, tw, 44);
       sctx.fillStyle = '#d7e3ef'; sctx.font = '12px Consolas,monospace';
       sctx.fillText(msgs[S.tut], W / 2, 146);
       sctx.fillStyle = '#7d93a8'; sctx.font = '10px Consolas,monospace';
-      sctx.fillText('[ESC] skip flight school', W / 2, 164);
-    } else if (S.diffIdx === 0 && S.tut === 8 && S.t < 113) {
+      sctx.fillText('[ESC] skip school', W / 2, 164);
+    } else if (S.diffIdx === 0 && S.tut === 10 && S.t < 133) {
       sctx.textAlign = 'center';
       sctx.fillStyle = '#8fe0a8'; sctx.font = 'bold 13px Consolas,monospace';
       sctx.fillText('FLIGHT SCHOOL COMPLETE — the enemy is committing. Good hunting, admiral.', W / 2, 147);
@@ -1672,7 +1725,7 @@ const Render = (() => {
       sctx.fillText('a space battleship saga — launch your fighters and bombers, and bring them home', W / 2, H * 0.27 + 54);
       const lines = [
         ['HELM', 'W/S thrust · A/D turn — she is fast for a leviathan. Use it.'],
-        ['ARSENAL', 'LMB broadside (show your FLANK) · T/RMB missile barrage · SPACE spinal torps'],
+        ['ARSENAL', 'LEFT CLICK broadside (show your flank) · T or RIGHT CLICK missiles · SPACE torpedoes'],
         ['WMG', 'hold H — bow-on, 2 seconds of courage, then the WAVE MOTION GUN erases the lane'],
         ['WINGS', '1-3 select · 4 all · L launch · Q intercept · E strike · F defend · G regroup'],
         ['THE SOUL', 'R = RECALL. Wounded fighters that dock are REPAIRED and fly again. Dead ones are gone.'],
@@ -1776,6 +1829,22 @@ const Render = (() => {
       g.fillRect(sx, sy, st.z > 0.5 ? 1.6 : 1, st.z > 0.5 ? 1.6 : 1);
     }
 
+    // broadside wedges: the one rule of the guns, drawn on the battlefield
+    if (S.mode === 'play' && !P.dead && S.stats.broadsides < 10 && !P.subs.weapons.disabled) {
+      const inArc = Sim.canBroadside(P);
+      const px2 = w2x(P.x), py2 = w2y(P.y), rr = 1500 * scale;
+      g.fillStyle = inArc ? 'rgba(110,230,150,0.055)' : 'rgba(120,160,200,0.03)';
+      g.strokeStyle = inArc ? 'rgba(110,230,150,0.4)' : 'rgba(120,160,200,0.18)';
+      g.lineWidth = 1;
+      for (const sgn of [1, -1]) {
+        const a0 = P.face + sgn * Math.PI / 2;
+        g.beginPath();
+        g.moveTo(px2, py2);
+        g.arc(px2, py2, rr, a0 - 0.95, a0 + 0.95);
+        g.closePath();
+        g.fill(); g.stroke();
+      }
+    }
     drawCarrier(S, P, now); drawCarrier(S, E, now);
 
     // ---- wave motion gun: charge at the bow, then the lance ----
@@ -1988,6 +2057,7 @@ const Audio2 = (() => {
         case 'subup': blip(520, 0.2, 'sine', 0.06, 780); break;
         case 'dock': blip(700, 0.12, 'sine', 0.06, 1050, pan); break;
         case 'rtb': blip(420, 0.14, 'sine', 0.04, 300, pan); break;
+        case 'dryfire': blip(140, 0.08, 'square', 0.04, 90); break;
         case 'ready': blip(880, 0.1, 'sine', 0.06); blip(1320, 0.16, 'sine', 0.06); break;   // ready chime
         case 'launch': noise(0.5, 0.14, 600, 2600, pan); break;
         case 'order': blip(740, 0.06, 'sine', 0.05, 950); break;
