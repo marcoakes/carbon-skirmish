@@ -14,7 +14,7 @@
 <script>
 "use strict";
 /* =====================================================================
-   STAR BLAZERS — CARBON SKIRMISH v12
+   STAR BLAZERS — CARBON SKIRMISH v13
    (an unofficial fan tribute to Star Blazers / Space Battleship Yamato)
    Shareable deterministic replays [C]/[V], the dreadnought EXECRATION
    with destructible subsystems, VANGUARD new-game+, native-DPI
@@ -179,11 +179,12 @@ const Destiny = (() => {
     };
   }
 
-  function reset() {
-    rng = mulberry32(0xC0FFEE);      // same seed every run: the site is deterministic
+  function reset(seed) {
+    // default site is fixed; the DAILY site passes today's date as the seed
+    rng = mulberry32(seed || 0xC0FFEE);
     nextId = 1;
     S = {
-      mode: 'intro', t: 0,
+      mode: 'intro', t: 0, seed: seed || 0,
       player: null, ships: [], projectiles: [], events: [],
       wave: 0, waveDelay: 0, kills: 0,
       lockTargetId: null, lockProgress: 0, locked: false, lockNeed: 0,
@@ -1061,6 +1062,7 @@ const Destiny = (() => {
   function tick(cmd) {
     if (S.mode === 'intro') {
       if (cmd.anyKey || cmd.restart) {
+        if (cmd.dailySeed) reset(cmd.dailySeed);
         S.mode = 'play'; S.waveDelay = 0.4; S.vanguard = !!cmd.vanguard;
         spawnFleet();
         if (cmd.veteranDraft) offerDraft();   // service-record perk: fit before wave 1
@@ -1069,7 +1071,7 @@ const Destiny = (() => {
       return;
     }
     if (cmd.restart) {
-      reset(); S.mode = 'play'; S.waveDelay = 0.4; S.vanguard = !!cmd.vanguard;
+      reset(cmd.dailySeed || 0); S.mode = 'play'; S.waveDelay = 0.4; S.vanguard = !!cmd.vanguard;
       spawnFleet();
       if (cmd.veteranDraft) offerDraft();
       S.events.push({ type: 'warpin', x: S.player.x, y: S.player.y, ang: -Math.PI / 2, big: true, fc: true });
@@ -1695,6 +1697,7 @@ const Trinity = (() => {
   let lights = [], grade = [60, 80, 140, 0.05];
   let crt = false, scanPat = null;
   try { crt = localStorage.getItem('cs_crt') === '1'; } catch (e) {}
+  let photoPrev = false, photoOfsX = 0, photoOfsY = 0, photoZoom = 1;
   const pick = a => a[(Math.random() * a.length) | 0];
   function say(line) {
     if (comms.length && comms[0].txt === line) return;
@@ -2715,8 +2718,8 @@ const Trinity = (() => {
       sctx.fillStyle = col; sctx.font = font; sctx.fillText(txt, 16, ty2); ty2 += 16;
     };
     hudLine((S.overtime ? 'OVERTIME — WAVE ' + S.otWave : 'WAVE ' + Math.min(S.wave, 4) + '/4')
-      + (S.vanguard ? '  ·  VANGUARD' : ''),
-      S.vanguard ? '#ffb35a' : '#8fa4b8', 'bold 12px Consolas,monospace');
+      + (S.vanguard ? '  ·  VANGUARD' : '') + (S.seed ? '  ·  DAILY' : ''),
+      S.vanguard ? '#ffb35a' : S.seed ? '#ffd978' : '#8fa4b8', 'bold 12px Consolas,monospace');
     hudLine('SCORE ' + S.score.toLocaleString() + (best ? '   BEST ' + best.toLocaleString() : ''),
       '#ffd978', 'bold 12px Consolas,monospace');
     if (S.combo > 1 && S.comboT > 0)
@@ -3278,11 +3281,16 @@ const Trinity = (() => {
           + ' · best overtime ' + rec2.bestOT
           + (M2.veteran() ? ' · pre-flight fitting UNLOCKED' : ''), W / 2, Math.min(bottom + 62, H - 24));
       }
-      let hook = '[V] watch a replay code   ·   [T] CRT mode';
+      let hook = '[V] replay · [X] daily site · [T] CRT · [M] music · [O] photo';
       if (M2 && M2.unlocked())
-        hook += '   ·   [B] VANGUARD ' + (M2.vanguardOn() ? 'ARMED — +35% enemies, ×1.5 score' : 'available');
+        hook += ' · [B] VANGUARD ' + (M2.vanguardOn() ? 'ARMED' : 'off');
       sctx.fillStyle = M2 && M2.vanguardOn() ? '#ffb35a' : 'rgba(140,165,190,0.8)';
-      sctx.fillText(hook, W / 2, Math.min(bottom + 78, H - 8));
+      sctx.fillText(hook, W / 2, Math.min(bottom + 78, H - 22));
+      if (Input.daily && Input.daily()) {
+        sctx.fillStyle = '#ffd978'; sctx.font = 'bold 12px Consolas,monospace';
+        sctx.fillText('● DAILY SITE ' + Meta.todaySeed() + " — the same battle for everyone · today's best: "
+          + Meta.dailyBest().toLocaleString(), W / 2, Math.min(bottom + 94, H - 6));
+      }
     } else if (S.mode === 'play' && S.paused) {
       sctx.fillStyle = 'rgba(2,4,9,0.62)'; sctx.fillRect(0, 0, W, H);
       const ty = Math.max(80, H * 0.14);
@@ -3360,6 +3368,21 @@ const Trinity = (() => {
     lastFrame = now;
     frameDt = dtF;
 
+    // photo mode: sim frozen by the glue; here we hide UI and free the camera
+    const photo = !!window.__photoOn;
+    if (photo && !photoPrev) { photoOfsX = 0; photoOfsY = 0; photoZoom = 1; }
+    photoPrev = photo;
+    if (photo && Input.photoKeys) {
+      const pk = Input.photoKeys();
+      const pan = 620 * dtF / Math.max(0.05, scale * photoZoom);
+      if (pk.a) photoOfsX -= pan;
+      if (pk.d) photoOfsX += pan;
+      if (pk.w) photoOfsY -= pan;
+      if (pk.s) photoOfsY += pan;
+      if (pk.zin) photoZoom = Math.min(3, photoZoom * (1 + 1.2 * dtF));
+      if (pk.zout) photoZoom = Math.max(0.4, photoZoom * (1 - 1.2 * dtF));
+    }
+
     // camera: lead ahead of velocity so motion reads instantly
     const ptx = p.px + (p.x - p.px) * lerp, pty = p.py + (p.y - p.py) * lerp;
     const lead = S.mode === 'play' || S.mode === 'dead' ? 0.55 : 0;
@@ -3375,6 +3398,8 @@ const Trinity = (() => {
         zoomT *= 1 + 0.3 * mix;
       }
     }
+    camTX += photoOfsX; camTY += photoOfsY;
+    zoomT *= photoZoom;
     cam.x += (camTX - cam.x) * (1 - Math.exp(-3.2 * dtF));
     cam.y += (camTY - cam.y) * (1 - Math.exp(-3.2 * dtF));
     zoomK += (zoomT - zoomK) * (1 - Math.exp(-2.5 * dtF));
@@ -3500,24 +3525,26 @@ const Trinity = (() => {
       sctx.globalCompositeOperation = 'source-over';
     }
 
-    // 4) world-anchored UI (crisp, no bloom)
-    floaters = floaters.filter(f => (f.life -= dtF) > 0);
-    for (const f of floaters) {
-      f.y -= 34 * dtF;
-      sctx.globalAlpha = clamp(f.life * 2, 0, 1);
-      sctx.fillStyle = f.col;
-      sctx.font = 'bold ' + (f.big ? 15 : 12) + 'px Consolas,monospace';
-      sctx.textAlign = 'center';
-      sctx.fillText(f.txt, w2sx(f.x), w2sy(f.y));
-    }
-    sctx.globalAlpha = 1;
-    drawLockUI(S, lerp);
-    drawOffscreen(S);
-    if (S.mode === 'play' && p.alive) {
-      sctx.strokeStyle = 'rgba(90,140,190,0.13)';
-      sctx.setLineDash([3, 7]);
-      sctx.beginPath(); sctx.arc(w2sx(ptx), w2sy(pty), 520 * scale, 0, TAU); sctx.stroke();
-      sctx.setLineDash([]);
+    // 4) world-anchored UI (crisp, no bloom) — hidden for clean photos
+    if (!photo) {
+      floaters = floaters.filter(f => (f.life -= dtF) > 0);
+      for (const f of floaters) {
+        f.y -= 34 * dtF;
+        sctx.globalAlpha = clamp(f.life * 2, 0, 1);
+        sctx.fillStyle = f.col;
+        sctx.font = 'bold ' + (f.big ? 15 : 12) + 'px Consolas,monospace';
+        sctx.textAlign = 'center';
+        sctx.fillText(f.txt, w2sx(f.x), w2sy(f.y));
+      }
+      sctx.globalAlpha = 1;
+      drawLockUI(S, lerp);
+      drawOffscreen(S);
+      if (S.mode === 'play' && p.alive) {
+        sctx.strokeStyle = 'rgba(90,140,190,0.13)';
+        sctx.setLineDash([3, 7]);
+        sctx.beginPath(); sctx.arc(w2sx(ptx), w2sy(pty), 520 * scale, 0, TAU); sctx.stroke();
+        sctx.setLineDash([]);
+      }
     }
 
     // 5) damage vignette + low-hull heartbeat
@@ -3575,14 +3602,14 @@ const Trinity = (() => {
     }
 
     // 7) HUD
-    if (S.mode === 'play' || S.mode === 'dead') {
+    if (!photo && (S.mode === 'play' || S.mode === 'dead')) {
       if (p.alive) { drawCapWheel(S); drawWmgStatus(S); }
       drawPanels(S);
       drawRadar(S);
       drawFleetUI(S, dtF);
       drawTouchUI(S);
     }
-    if (S.mode === 'play' && !S.paused) {
+    if (!photo && S.mode === 'play' && !S.paused) {
       drawTutorial(S, dtF);
       drawDraft(S);
     }
@@ -3590,7 +3617,7 @@ const Trinity = (() => {
     // cinema letterbox during the money moments
     const cineTarget = ((S.wmg && S.wmg.charging) || S.beamT > 0 || killcam) ? 1 : 0;
     cine += (cineTarget - cine) * (1 - Math.exp(-5 * dtF));
-    if (cine > 0.01) {
+    if (!photo && cine > 0.01) {
       const bh = H * 0.08 * cine;
       sctx.fillStyle = 'rgba(0,0,0,0.92)';
       sctx.fillRect(0, 0, W, bh);
@@ -3599,7 +3626,7 @@ const Trinity = (() => {
 
     // replay badge
     const RI = window.__replayInfo ? window.__replayInfo() : null;
-    if (RI && RI.active) {
+    if (!photo && RI && RI.active) {
       sctx.save();
       sctx.shadowColor = 'rgba(235,85,70,0.8)'; sctx.shadowBlur = 10;
       sctx.fillStyle = '#ff7d70'; sctx.font = 'bold 14px Consolas,monospace'; sctx.textAlign = 'center';
@@ -3607,7 +3634,7 @@ const Trinity = (() => {
       sctx.restore();
     }
 
-    overlay(S);
+    if (!photo) overlay(S);
 
     // retro CRT mode [T]: scanlines, phosphor flicker, tube vignette
     if (crt) {
@@ -3629,6 +3656,11 @@ const Trinity = (() => {
       cvg.addColorStop(0, 'rgba(0,0,0,0)');
       cvg.addColorStop(1, 'rgba(0,0,5,0.35)');
       sctx.fillStyle = cvg; sctx.fillRect(0, 0, W, H);
+    }
+
+    if (photo) {
+      sctx.fillStyle = 'rgba(200,220,240,0.6)'; sctx.font = '11px Consolas,monospace'; sctx.textAlign = 'center';
+      sctx.fillText('PHOTO — WASD pan · [+]/[−] zoom · Enter save · O exit', W / 2, H - 12);
     }
   }
 
@@ -3666,12 +3698,24 @@ const Aura = (() => {
   let ac = null, master = null, noiseBuf = null, abGain = null;
   let droneGain = null, engGain = null, engFilter = null;
   let wmgOsc = null, wmgOscGain = null, wmgSwellGain = null, wmgSwellFilter = null;
+  let musicGain = null, mNext = 0, mStep = 0, musicOn = true;
+  try { musicOn = localStorage.getItem('cs_music') !== '0'; } catch (e) {}
+  // A-minor battle theme data: chords, a walking bass, a pentatonic arp
+  const CHORDS = [[0, 3, 7], [-2, 2, 5]];
+  const BASS = [0, -1, 0, -1, 3, -1, 0, -1, 5, -1, 3, -1, 7, -1, 5, 3];
+  const ARP = [0, 3, 5, 7, 10, 12, 10, 7];
 
   function ensure() {
     if (!ac) {
       try {
         ac = new (window.AudioContext || window.webkitAudioContext)();
-        master = ac.createGain(); master.gain.value = 0.5; master.connect(ac.destination);
+        // master → compressor → out: glues the mix, lets the cannons hit hard
+        const comp = ac.createDynamicsCompressor();
+        comp.threshold.value = -18; comp.knee.value = 12; comp.ratio.value = 5;
+        comp.attack.value = 0.003; comp.release.value = 0.2;
+        comp.connect(ac.destination);
+        master = ac.createGain(); master.gain.value = 0.5; master.connect(comp);
+        musicGain = ac.createGain(); musicGain.gain.value = 0; musicGain.connect(master);
         const len = ac.sampleRate;
         noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
         const d = noiseBuf.getChannelData(0);
@@ -3743,13 +3787,51 @@ const Aura = (() => {
     src.start(); src.stop(ac.currentTime + dur);
   }
 
+  // schedule-at-time voices for the sequencer
+  function tone(t2, freq, dur, type, vol, filt, slideTo) {
+    if (!ac) return;
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type; o.frequency.setValueAtTime(freq, t2);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t2 + dur);
+    g.gain.setValueAtTime(0.0001, t2);
+    g.gain.linearRampToValueAtTime(vol, t2 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t2 + dur);
+    let node = o;
+    if (filt) {
+      const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = filt;
+      o.connect(f); node = f;
+    }
+    node.connect(g); g.connect(musicGain);
+    o.start(t2); o.stop(t2 + dur + 0.03);
+  }
+  function noiseAt(t2, dur, vol, bp) {
+    if (!ac) return;
+    const src = ac.createBufferSource(); src.buffer = noiseBuf;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = bp; f.Q.value = 0.9;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(vol, t2);
+    g.gain.exponentialRampToValueAtTime(0.0001, t2 + dur);
+    src.connect(f); f.connect(g); g.connect(musicGain);
+    src.start(t2); src.stop(t2 + dur);
+  }
+
   function handle(evts, S) {
     if (!ac) return;
     const px = S && S.player ? S.player.x : 0;
     for (const e of evts) {
       const pan = e.x != null ? clamp((e.x - px) / 900, -0.85, 0.85) : 0;
       switch (e.type) {
-        case 'muzzle': if (e.player) { blip(600, 0.08, 'square', 0.045, 200, pan); noise(0.05, 0.03, 3500, 800, pan); } break;
+        case 'muzzle':
+          if (e.player) {   // main battery: sub-thump + saw body + crack
+            const pv = 0.9 + Math.random() * 0.2;
+            blip(130 * pv, 0.16, 'sine', 0.14, 42, pan);
+            blip(190 * pv, 0.1, 'sawtooth', 0.05, 60, pan);
+            noise(0.09, 0.1, 2400, 260, pan);
+          } else {
+            blip(160, 0.09, 'sawtooth', 0.03, 55, pan);
+            noise(0.06, 0.04, 1600, 300, pan);
+          }
+          break;
         case 'hit': e.layer === 'shield' ? blip(950, 0.07, 'triangle', 0.04, 500, pan) : noise(0.12, 0.06, 900, 200, pan); break;
         case 'boom': noise(e.big ? 1.4 : 0.6, e.big ? 0.5 : 0.3, 900, 50, pan); blip(70, e.big ? 1 : 0.5, 'sine', 0.2, 28, pan); break;
         case 'torpboom': if (!e.fizzle) { noise(0.8, 0.4, 700, 40, pan); blip(60, 0.7, 'sine', 0.25, 25, pan); } break;
@@ -3807,9 +3889,51 @@ const Aura = (() => {
       wmgSwellGain.gain.setTargetAtTime(ch > 0 ? 0.02 + 0.13 * ch * ch : 0, t, 0.08);
       wmgSwellFilter.frequency.setTargetAtTime(300 + 2600 * ch, t, 0.08);
     }
+
+    // ---- the score: a step-sequenced battle theme that follows the fight ----
+    if (musicGain) {
+      const hn2 = S.ships ? S.ships.filter(s => s.alive && s.faction === 'hostile').length : 0;
+      const boss = S.ships && S.ships.some(s => s.alive && (s.cls === 'cruiser' || s.cls === 'dread'));
+      let inten = 0;
+      if (S.mode === 'play' && !S.paused) inten = boss ? 3 : hn2 >= 4 ? 2 : hn2 >= 1 ? 1 : 0;
+      const ducked = (S.wmg && S.wmg.charging) || S.beamT > 0;
+      musicGain.gain.setTargetAtTime(!musicOn ? 0 : ducked ? 0.05 : 0.24, t, ducked ? 0.05 : 0.6);
+      if (musicOn) {
+        const stepD = 60 / 112 / 4;   // 112 BPM, 16th notes
+        if (mNext < t) mNext = t + 0.05;   // resync after a tab-away
+        while (mNext < t + 0.15) {
+          const st2 = mStep % 16, bar = (mStep >> 4) % 2;
+          const semis = CHORDS[bar];
+          if (st2 === 0)   // pad
+            for (const sN of semis) tone(mNext, 110 * Math.pow(2, sN / 12), stepD * 16, 'sine', 0.018, 700);
+          if (inten >= 1) {
+            if (st2 % 4 === 0) tone(mNext, 150, 0.1, 'sine', 0.1, 0, 48);   // kick
+            const bN = BASS[st2];
+            if (bN >= 0) tone(mNext, 55 * Math.pow(2, (bN + (bar ? -2 : 0)) / 12), stepD * 1.6, 'sawtooth', 0.05, 260);
+          }
+          if (inten >= 2) {
+            if (st2 === 4 || st2 === 12) noiseAt(mNext, 0.08, 0.05, 1900);   // snare
+            tone(mNext, 220 * Math.pow(2, ARP[(mStep * 3) % ARP.length] / 12), stepD * 0.9, 'triangle', 0.022, 1600);
+          }
+          if (inten >= 3 && st2 === 0)   // detuned brass stabs for the bosses
+            for (const sN of semis) {
+              tone(mNext, 110 * Math.pow(2, sN / 12), stepD * 6, 'sawtooth', 0.03, 900);
+              tone(mNext, 110 * Math.pow(2, sN / 12) * 1.007, stepD * 6, 'sawtooth', 0.025, 900);
+            }
+          mStep++; mNext += stepD;
+        }
+      }
+    }
   }
 
-  return { ensure, handle, update };
+  return {
+    ensure, handle, update,
+    toggleMusic: () => {
+      musicOn = !musicOn;
+      try { localStorage.setItem('cs_music', musicOn ? '1' : '0'); } catch (e) {}
+      return musicOn;
+    }
+  };
 })();
 
 /* =====================================================================
@@ -3821,6 +3945,9 @@ const Meta = (() => {
   let vanguard = false;
   try { vanguard = localStorage.getItem('cs_vanguard') === '1'; } catch (e) {}
   let runLogged = false;
+  const todaySeed = () => +new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  let daily = { seed: 0, score: 0 };
+  try { daily = Object.assign(daily, JSON.parse(localStorage.getItem('cs_daily') || '{}')); } catch (e) {}
   function frame(S) {
     if ((S.mode === 'victory' || S.mode === 'dead') && !runLogged) {
       runLogged = true;
@@ -3828,11 +3955,17 @@ const Meta = (() => {
       if (S.mode === 'victory') meta.victories++;
       if (S.otWave > meta.bestOT) meta.bestOT = S.otWave;
       try { localStorage.setItem('cs_meta', JSON.stringify(meta)); } catch (e) {}
+      if (S.seed && S.seed === todaySeed() && S.score > (daily.seed === S.seed ? daily.score : 0)) {
+        daily = { seed: S.seed, score: S.score };
+        try { localStorage.setItem('cs_daily', JSON.stringify(daily)); } catch (e) {}
+      }
     }
     if (S.mode === 'play' || S.mode === 'intro') runLogged = false;
   }
   return {
     frame,
+    todaySeed,
+    dailyBest: () => (daily.seed === todaySeed() ? daily.score : 0),
     get: () => meta,
     unlocked: () => meta.victories > 0,
     vanguardOn: () => vanguard && meta.victories > 0,
@@ -3852,7 +3985,7 @@ const Meta = (() => {
    ===================================================================== */
 const Input = (() => {
   const held = new Set();
-  let tab = false, restart = false, anyKey = false, pause = false, overtimeKey = false, missileKey = false, orderKey = null, pickKey = 0, click = null;
+  let tab = false, restart = false, anyKey = false, pause = false, overtimeKey = false, missileKey = false, orderKey = null, pickKey = 0, click = null, dailyOn = false;
   const ORDER_KEYS = { 1: 'focus', 2: 'defend', 3: 'free', 4: 'regroup' };
   const ALIAS = { arrowup: 'w', arrowdown: 's', arrowleft: 'a', arrowright: 'd', z: 'w', q: 'a' };
 
@@ -3863,12 +3996,28 @@ const Input = (() => {
     let k = e.key.toLowerCase();
     if (ALIAS[k]) k = ALIAS[k];
     if (k === 'p' || k === 'escape') { pause = true; return; }
-    if (k === 'c' || k === 'v' || k === 'b' || k === 't') {   // meta keys never launch the game
+    if (k === 'enter' && window.__photoOn) {
+      if (window.__savePhoto) window.__savePhoto();
+      return;
+    }
+    if (k === 'c' || k === 'v' || k === 'b' || k === 't' || k === 'x' || k === 'm' || k === 'o') {
+      // meta keys never launch the game
       if (k === 'c' && window.__copyReplay) window.__copyReplay();
       if (k === 'v' && window.__watchReplay) window.__watchReplay();
       if (k === 'b' && Meta.unlocked())
         Trinity.note('VANGUARD ' + (Meta.toggleVanguard() ? 'ARMED — +35% enemies, ×1.5 score' : 'STOOD DOWN'));
       if (k === 't') Trinity.note('CRT MODE ' + (Trinity.toggleCrt() ? 'ON' : 'OFF'));
+      if (k === 'x') {
+        dailyOn = !dailyOn;
+        Trinity.note(dailyOn
+          ? 'DAILY SITE ' + Meta.todaySeed() + ' ARMED — the same battle for everyone today'
+          : 'DAILY SITE OFF');
+      }
+      if (k === 'm') Trinity.note('MUSIC ' + (Aura.toggleMusic() ? 'ON' : 'OFF'));
+      if (k === 'o') {
+        window.__photoOn = !window.__photoOn;
+        Trinity.note(window.__photoOn ? 'PHOTO MODE — WASD pan · +/− zoom · Enter save · O exit' : 'PHOTO MODE OFF');
+      }
       return;
     }
     anyKey = true;
@@ -3955,6 +4104,7 @@ const Input = (() => {
       pick: pickKey,
       vanguard: Meta.vanguardOn(),
       veteranDraft: Meta.veteran(),
+      dailySeed: dailyOn ? Meta.todaySeed() : 0,
       clickWorld: null, lockId: null
     };
     if (click) {
@@ -3971,7 +4121,13 @@ const Input = (() => {
     tab = false; restart = false; anyKey = false; pause = false; overtimeKey = false; missileKey = false; orderKey = null; pickKey = 0; click = null;
     return cmd;
   }
-  return { consume, touch: () => ({ mode: touchMode, joy, btns: touchButtons(), held: heldBtns }) };
+  return {
+    consume,
+    touch: () => ({ mode: touchMode, joy, btns: touchButtons(), held: heldBtns }),
+    daily: () => dailyOn,
+    photoKeys: () => ({ w: held.has('w'), a: held.has('a'), s: held.has('s'), d: held.has('d'),
+      zin: held.has('='), zout: held.has('-') })
+  };
 })();
 
 (function main() {
@@ -3979,7 +4135,7 @@ const Input = (() => {
      run-length-encoded input stream. Record every run; export/import
      as a compact code; play back by feeding the log to Destiny. */
   const BOOLS = { ab: 1, wmg: 1, heat: 1, tab: 1, restart: 1, anyKey: 1, pause: 1, overtime: 1, missile: 1, vanguard: 1, veteranDraft: 1 };
-  const CMD_KEYS = ['thrustX', 'thrustY', 'turn', 'forward', 'ab', 'wmg', 'heat', 'tab', 'restart', 'anyKey', 'pause', 'overtime', 'missile', 'order', 'pick', 'clickWorld', 'lockId', 'vanguard', 'veteranDraft'];
+  const CMD_KEYS = ['thrustX', 'thrustY', 'turn', 'forward', 'ab', 'wmg', 'heat', 'tab', 'restart', 'anyKey', 'pause', 'overtime', 'missile', 'order', 'pick', 'clickWorld', 'lockId', 'vanguard', 'veteranDraft', 'dailySeed'];
   function packCmd(c) {
     return CMD_KEYS.map(k => {
       const v = c[k];
@@ -4085,6 +4241,15 @@ const Input = (() => {
   };
   window.__replayInfo = () => ({ active: Replay.active, done: Replay.done });
   window.__rp = { packCmd, unpackCmd, Rec, Replay, deflate, inflate };
+  window.__savePhoto = function () {
+    try {
+      const a = document.createElement('a');
+      a.download = 'star-blazers-' + Date.now() + '.png';
+      a.href = document.getElementById('cv').toDataURL('image/png');
+      a.click();
+      Trinity.note('FRAME SAVED');
+    } catch (e) { Trinity.note('Could not save frame'); }
+  };
 
   let last = performance.now() / 1000, acc = 0;
   function frame() {
@@ -4096,6 +4261,7 @@ const Input = (() => {
       const ic = Input.consume();   // only the exit key matters while spectating
       if (ic.restart) exitReplay = true;
     }
+    if (window.__photoOn) { Input.consume(); acc = 0; }   // photo mode freezes the sim
     while (acc >= TICK) {
       let cmd;
       if (Replay.active) {
