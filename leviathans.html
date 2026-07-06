@@ -14,7 +14,7 @@
 <script>
 "use strict";
 /* =====================================================================
-   LEVIATHANS — a capital-class carrier duel  [build v3.0-whole-game]
+   LEVIATHANS — a capital-class carrier duel  [build v3.1-simpler-school]
    (companion piece to STAR BLAZERS: Carbon Skirmish — same DNA:
     a fixed-tick simulation that owns all state, a renderer that only
     reads it, and WebAudio synthesis for every sound. One file, no deps.)
@@ -317,7 +317,7 @@ const Sim = (() => {
     fr.face = toFoe;
     fr.gunCd -= TICK; fr.pdCd -= TICK;
     // light turret: duel enemy pickets first, then harass their carrier
-    if (fr.gunCd <= 0) {
+    if (fr.gunCd <= 0 && !(fr.side === 'E' && tutHold())) {   // pickets honor flight school too
       let tv = null, bfd = 950;
       for (const g2 of S.frigates)
         if (!g2.dead && g2.side !== fr.side) {
@@ -866,7 +866,7 @@ const Sim = (() => {
       if (S.tutFly > 1.4) S.tut = 1;
     }
     else if (S.tut === 1 && S.stats.sorties > 0) S.tut = 2;
-    else if (S.tut === 2 && S.fighters.some(f => f.side === 'P' && f.state === 'strike')) S.tut = 3;
+    else if (S.tut === 2 && S.fighters.some(f => f.side === 'P' && f.role === 'BMB' && f.state !== 'docked')) S.tut = 3;
     else if (S.tut === 3 && S.fighters.some(f => f.side === 'P' && f.state === 'recall')) S.tut = 4;
     else if (S.tut === 4 && cmd.preset) S.tut = 5;
 
@@ -1502,7 +1502,7 @@ const Render = (() => {
       const msgs = [
         'FLIGHT SCHOOL 1/5 — fly the ship: [W] thrust · [A]/[D] turn   (the enemy is holding off)',
         'FLIGHT SCHOOL 2/5 — press [L] to LAUNCH your selected wing from the hangar',
-        'FLIGHT SCHOOL 3/5 — select wing [2] and order a STRIKE with [E] — bombers gut subsystems',
+        'FLIGHT SCHOOL 3/5 — press [2] then [L]: launch your BOMBERS — they strike the target on their own',
         'FLIGHT SCHOOL 4/5 — press [R] to RECALL a wing — docked fighters repair and rearm',
         'FLIGHT SCHOOL 5/5 — set a power preset: [Z] weapons · [X] balanced · [C] shields · [V] hangar'
       ];
