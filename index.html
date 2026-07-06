@@ -3824,9 +3824,9 @@ const Aura = (() => {
         case 'muzzle':
           if (e.player) {   // main battery: sub-thump + saw body + crack
             const pv = 0.9 + Math.random() * 0.2;
-            blip(130 * pv, 0.16, 'sine', 0.14, 42, pan);
-            blip(190 * pv, 0.1, 'sawtooth', 0.05, 60, pan);
-            noise(0.09, 0.1, 2400, 260, pan);
+            blip(120 * pv, 0.2, 'sine', 0.22, 38, pan);
+            blip(185 * pv, 0.12, 'sawtooth', 0.07, 55, pan);
+            noise(0.11, 0.15, 2600, 220, pan);
           } else {
             blip(160, 0.09, 'sawtooth', 0.03, 55, pan);
             noise(0.06, 0.04, 1600, 300, pan);
@@ -3897,7 +3897,7 @@ const Aura = (() => {
       let inten = 0;
       if (S.mode === 'play' && !S.paused) inten = boss ? 3 : hn2 >= 4 ? 2 : hn2 >= 1 ? 1 : 0;
       const ducked = (S.wmg && S.wmg.charging) || S.beamT > 0;
-      musicGain.gain.setTargetAtTime(!musicOn ? 0 : ducked ? 0.05 : 0.24, t, ducked ? 0.05 : 0.6);
+      musicGain.gain.setTargetAtTime(!musicOn ? 0 : ducked ? 0.05 : 0.3, t, ducked ? 0.05 : 0.6);
       if (musicOn) {
         const stepD = 60 / 112 / 4;   // 112 BPM, 16th notes
         if (mNext < t) mNext = t + 0.05;   // resync after a tab-away
@@ -3905,7 +3905,9 @@ const Aura = (() => {
           const st2 = mStep % 16, bar = (mStep >> 4) % 2;
           const semis = CHORDS[bar];
           if (st2 === 0)   // pad
-            for (const sN of semis) tone(mNext, 110 * Math.pow(2, sN / 12), stepD * 16, 'sine', 0.018, 700);
+            for (const sN of semis) tone(mNext, 110 * Math.pow(2, sN / 12), stepD * 16, 'sine', 0.04, 700);
+          if (st2 % 4 === 2)   // slow title arpeggio — the theme is always present
+            tone(mNext, 220 * Math.pow(2, ARP[((mStep >> 2) * 5) % ARP.length] / 12), stepD * 3.4, 'triangle', 0.03, 1200);
           if (inten >= 1) {
             if (st2 % 4 === 0) tone(mNext, 150, 0.1, 'sine', 0.1, 0, 48);   // kick
             const bN = BASS[st2];
