@@ -14,7 +14,7 @@
 <script>
 "use strict";
 /* =====================================================================
-   LEVIATHANS — a capital-class carrier duel  [build v2.5-even-odds]
+   LEVIATHANS — a capital-class carrier duel  [build v3.0-whole-game]
    (companion piece to STAR BLAZERS: Carbon Skirmish — same DNA:
     a fixed-tick simulation that owns all state, a renderer that only
     reads it, and WebAudio synthesis for every sound. One file, no deps.)
@@ -60,12 +60,25 @@ const Sim = (() => {
 
   const DIFF = [
     { name: 'ENSIGN', think: 1.3, repair: 0.8, aggro: 0.8, pdAcc: 0.38, dmgMul: 0.6, ehull: 2500 },
-    { name: 'CAPTAIN', think: 0.8, repair: 1.0, aggro: 1.0, pdAcc: 0.52, dmgMul: 1.1, ehull: 3100 },
-    { name: 'ADMIRAL', think: 0.45, repair: 1.5, aggro: 1.25, pdAcc: 0.8, dmgMul: 1.75, ehull: 3800 }
+    { name: 'CAPTAIN', think: 0.8, repair: 1.0, aggro: 1.0, pdAcc: 0.52, dmgMul: 0.85, ehull: 2900 },
+    { name: 'ADMIRAL', think: 0.45, repair: 1.25, aggro: 1.25, pdAcc: 0.58, dmgMul: 0.95, ehull: 3200 }
   ];
 
   let S = null, nextId = 1;
   const R = Math.random;   // no replay requirement here: honest dice
+
+  // ---- service record: rank, best score, career totals (localStorage) ----
+  const RANKS = [['CADET', 0], ['ENSIGN', 2000], ['LIEUTENANT', 4000], ['CAPTAIN', 6500],
+                 ['COMMODORE', 10000], ['ADMIRAL OF THE FLEET', 15000]];
+  const rankFor = best => { let r = RANKS[0][0]; for (const [n, th] of RANKS) if (best >= th) r = n; return r; };
+  const nextRank = best => { for (const [n, th] of RANKS) if (best < th) return [n, th]; return null; };
+  function loadRecord() {
+    try {
+      const r = JSON.parse(localStorage.getItem('lev_record') || 'null');
+      if (r && typeof r.battles === 'number') return r;
+    } catch (e) {}
+    return { battles: 0, wins: [0, 0, 0], best: 0, saved: 0, lost: 0, perfect: 0 };
+  }
 
   function makeCarrier(side, x, y, face) {
     const c = {
@@ -108,13 +121,17 @@ const Sim = (() => {
       stats: { lost: 0, saved: 0, dealt: 0, taken: 0, sorties: 0 },
       paused: false, winner: null, endT: 0,
       beamT: 0, beamN: 0,
-      tut: 0, tutT: 0
+      stage: 1, stage2T: 0,
+      score: 0, perfect: false, newBest: false, record: loadRecord(),
+      frigates: [],
+      tut: 0, tutT: 0, tutFly: 0, tutSkip: false
     };
     S.E.hull = S.E.hullMax = DIFF[di].ehull;
     for (let sq = 0; sq < 3; sq++) {
       for (let sl = 0; sl < 8; sl++) S.fighters.push(makeFighter('P', sq, sl));
       for (let sl = 0; sl < 6; sl++) S.fighters.push(makeFighter('E', sq, sl));
     }
+    for (const sd of ['P', 'E']) for (let i = 0; i < 2; i++) S.frigates.push(makeFrigate(sd, i));
     return S;
   }
 
@@ -163,9 +180,13 @@ const Sim = (() => {
     evt({ type: 'armorhit', x, y, big: dmg > 40 });
     if (c.hull <= 0 && !c.dead) {
       c.dead = true; c.hull = 0;
-      S.winner = c.side === 'E' ? 'P' : 'E';
-      S.endT = S.t;
       evt({ type: 'carrierdeath', c });
+      if (c.side === 'E' && S.stage === 1 && S.diffIdx >= 1) {
+        S.stage = 2; S.stage2T = 18;   // CAPTAIN+: a second contact is inbound — brace
+      } else {
+        S.winner = c.side === 'E' ? 'P' : 'E';
+        S.endT = S.t;
+      }
     }
   }
 
@@ -256,6 +277,87 @@ const Sim = (() => {
     evt({ type: 'boom', x: f.x, y: f.y, r: 12 });
     evt({ type: 'fighterdown', side: f.side });
     if (f.side === 'P') S.stats.lost++;
+  }
+
+  // ---- escort frigates: two pickets per side — a screen, not a fleet ----
+  function makeFrigate(side, i) {
+    const c = side === 'P' ? S.P : S.E;
+    const perp = i ? 1 : -1;
+    return {
+      side, i,
+      x: c.x - Math.cos(c.face) * 120 - Math.sin(c.face) * perp * 260,
+      y: c.y - Math.sin(c.face) * 120 + Math.cos(c.face) * perp * 260,
+      vx: 0, vy: 0, face: c.face, hp: 560, max: 560, radius: 55,
+      gunCd: 1 + R() * 2, pdCd: R() * 0.6, dead: false
+    };
+  }
+  function hitFrigate(fr, dmg, x, y) {
+    if (fr.dead) return;
+    fr.hp -= dmg;
+    if (fr.hp <= 0) {
+      fr.dead = true;
+      evt({ type: 'boom', x: fr.x, y: fr.y, r: 30, big: true });
+      evt({ type: 'frigatedown', side: fr.side, x: fr.x, y: fr.y });
+    }
+  }
+  function tickFrigate(fr) {
+    if (fr.dead) return;
+    const own = fr.side === 'P' ? S.P : S.E, foe = foeOf(own);
+    // hold station between our carrier and theirs — a screening picket
+    const toFoe = Math.atan2(foe.y - own.y, foe.x - own.x);
+    const perp = fr.i ? 1 : -1;
+    const stx = own.x + Math.cos(toFoe) * 300 - Math.sin(toFoe) * perp * 190;
+    const sty = own.y + Math.sin(toFoe) * 300 + Math.cos(toFoe) * perp * 190;
+    const d2 = dist(fr.x, fr.y, stx, sty) || 1;
+    const spd = Math.min(165, d2 * 0.8);
+    const k = 1 - Math.exp(-1.6 * TICK);
+    fr.vx += ((stx - fr.x) / d2 * spd - fr.vx) * k;
+    fr.vy += ((sty - fr.y) / d2 * spd - fr.vy) * k;
+    fr.x += fr.vx * TICK; fr.y += fr.vy * TICK;
+    fr.face = toFoe;
+    fr.gunCd -= TICK; fr.pdCd -= TICK;
+    // light turret: duel enemy pickets first, then harass their carrier
+    if (fr.gunCd <= 0) {
+      let tv = null, bfd = 950;
+      for (const g2 of S.frigates)
+        if (!g2.dead && g2.side !== fr.side) {
+          const dd = dist(fr.x, fr.y, g2.x, g2.y);
+          if (dd < bfd) { bfd = dd; tv = g2; }
+        }
+      if (!tv && !foe.dead && dist(fr.x, fr.y, foe.x, foe.y) < 1200) tv = foe;
+      if (tv) {
+        const tof = dist(fr.x, fr.y, tv.x, tv.y) / 620;
+        const a = Math.atan2(tv.y + tv.vy * tof - fr.y, tv.x + tv.vx * tof - fr.x) + (R() - 0.5) * 0.05;
+        S.projectiles.push({
+          kind: 'shell', side: fr.side, x: fr.x, y: fr.y,
+          vx: Math.cos(a) * 620, vy: Math.sin(a) * 620, dmg: 16, life: 2.0
+        });
+        evt({ type: 'pew', x: fr.x, y: fr.y, side: fr.side });
+        fr.gunCd = 3.2 + R() * 0.6;
+      }
+    }
+    // one PD mount: torpedoes first, then fighters
+    if (fr.pdCd <= 0) {
+      let tgt = null, bd2 = 320, isTorp = false;
+      for (const pr of S.projectiles)
+        if ((pr.kind === 'storp' || pr.kind === 'miss') && pr.side !== fr.side) {
+          const dd = dist(fr.x, fr.y, pr.x, pr.y);
+          if (dd < bd2) { bd2 = dd; tgt = pr; isTorp = true; }
+        }
+      if (!tgt) for (const f of S.fighters) {
+        if (!f.alive || f.side === fr.side || f.state === 'docked') continue;
+        const dd = dist(fr.x, fr.y, f.x, f.y);
+        if (dd < bd2) { bd2 = dd; tgt = f; isTorp = false; }
+      }
+      if (tgt) {
+        fr.pdCd = 0.8 + R() * 0.5;
+        evt({ type: 'pd', x: fr.x, y: fr.y, tx: tgt.x, ty: tgt.y });
+        if (R() < 0.42) {
+          if (isTorp) { tgt.hp -= 8; if (tgt.hp <= 0) { tgt.dead = true; evt({ type: 'boom', x: tgt.x, y: tgt.y, r: 10 }); } }
+          else { tgt.hp -= 4; evt({ type: 'fhit', x: tgt.x, y: tgt.y }); if (tgt.hp <= 0) killFighter(tgt); }
+        }
+      } else fr.pdCd = 0.25;
+    }
   }
 
   // ---- fighter brains: steering + role behaviors ----
@@ -413,6 +515,17 @@ const Sim = (() => {
         pr.vx = Math.cos(na) * 150; pr.vy = Math.sin(na) * 150;
         pr.x += pr.vx * TICK; pr.y += pr.vy * TICK;
         pr.life -= TICK;
+        // pickets can body-block a torpedo — that is their job
+        for (const fr of S.frigates) {
+          if (fr.dead || fr.side === pr.side) continue;
+          if (dist(pr.x, pr.y, fr.x, fr.y) < fr.radius + 8) {
+            pr.dead = true;
+            evt({ type: 'boom', x: pr.x, y: pr.y, r: 26, big: true });
+            hitFrigate(fr, pr.dmg, pr.x, pr.y);
+            break;
+          }
+        }
+        if (pr.dead) continue;
         if (dist(pr.x, pr.y, tp.x, tp.y) < 46) {
           pr.dead = true;
           evt({ type: 'boom', x: pr.x, y: pr.y, r: 26, big: true });
@@ -461,6 +574,17 @@ const Sim = (() => {
         }
         if (pr.dead) continue;
       }
+      // vs frigates
+      for (const fr of S.frigates) {
+        if (fr.dead || fr.side === pr.side) continue;
+        if (dist(pr.x, pr.y, fr.x, fr.y) < fr.radius) {
+          pr.dead = true;
+          hitFrigate(fr, pr.dmg, pr.x, pr.y);
+          evt({ type: 'armorhit', x: pr.x, y: pr.y, big: pr.dmg > 40 });
+          break;
+        }
+      }
+      if (pr.dead) continue;
       // vs carriers
       const foe = pr.side === 'P' ? S.E : S.P;
       if (!foe.dead && dist(pr.x, pr.y, foe.x, foe.y) < foe.radius) {
@@ -569,9 +693,11 @@ const Sim = (() => {
   }
 
   // ---- the enemy admiral: a mirror who actually thinks ----
+  const tutHold = () => S.diffIdx === 0 && !S.tutSkip && S.tut < 5 && S.t < 75;
   function tickAI() {
     const E = S.E, P = S.P;
     if (E.dead) return;
+    const school = tutHold();   // flight school: the enemy stands off and holds fire
     S.aiThinkT -= TICK;
     // continuous helm: hold a broadside band, kite when hurt, press when ahead
     const d = dist(E.x, E.y, P.x, P.y);
@@ -579,6 +705,7 @@ const Sim = (() => {
     let want = 820;
     if (hurt < 0.4) want = 1250;
     else if (ahead > 0.15) want = 680 / S.diff.aggro;
+    if (school) want = 1700;
     const toP = Math.atan2(P.y - E.y, P.x - E.x);
     // face so P sits on our broadside (±90°)
     const flank = wrapA(toP - E.face) > 0 ? 1 : -1;
@@ -593,7 +720,7 @@ const Sim = (() => {
     E.vy += ((Math.sin(toP) * push + Math.cos(toP) * flank * tang) * spd - E.vy) * k;
     E.x += E.vx * TICK; E.y += E.vy * TICK;
 
-    if (S.aiThinkT > 0) return;
+    if (S.aiThinkT > 0 || school) return;
     S.aiThinkT = S.diff.think;
     // power doctrine
     if (E.shield < E.shieldMax * 0.25) E.power = { ...PRESETS.shields };
@@ -695,28 +822,75 @@ const Sim = (() => {
         if (f.alive && f.side === 'E' && f.state !== 'docked' && inCorr(f.x, f.y, 95)) killFighter(f);
       for (const pr of S.projectiles)
         if (pr.side === 'E' && inCorr(pr.x, pr.y, 95)) pr.dead = true;
-      if (S.beamN % 6 === 0 && !S.E.dead && inCorr(S.E.x, S.E.y, 95 + S.E.radius))
-        hitCarrier(S.E, 72, S.E.x, S.E.y, P.targetSub, true);
+      if (S.beamN % 6 === 0) {
+        for (const fr of S.frigates)
+          if (!fr.dead && fr.side === 'E' && inCorr(fr.x, fr.y, 135)) hitFrigate(fr, 90, fr.x, fr.y);
+        if (!S.E.dead && inCorr(S.E.x, S.E.y, 95 + S.E.radius))
+          hitCarrier(S.E, 72, S.E.x, S.E.y, P.targetSub, true);
+      }
+    }
+
+    // second contact: a fresh hostile warps in after the first kill (CAPTAIN+)
+    if (S.stage === 2 && S.stage2T > 0) {
+      S.stage2T -= TICK;
+      // damage control parties: the breather patches the hull, up to a point
+      if (!P.dead) P.hull = Math.min(P.hullMax * 0.8, P.hull + 45 * TICK);
+      if (S.stage2T <= 0) {
+        const ang = Math.atan2(S.E.y - P.y, S.E.x - P.x) + (R() - 0.5) * 1.4;
+        S.E = makeCarrier('E', P.x + Math.cos(ang) * 2300, P.y + Math.sin(ang) * 2300, ang + Math.PI);
+        S.E.hull = S.E.hullMax = Math.round(S.diff.ehull * 0.75);
+        // this admiral is angrier than the last one — truly furious on ADMIRAL
+        const anger = S.diffIdx === 2 ? 0.25 : 0.1;
+        S.diff = { ...S.diff, aggro: S.diff.aggro + anger, think: Math.max(0.4, S.diff.think - 0.1) };
+        for (const f of S.fighters) if (f.side === 'E') { f.alive = false; f.state = 'dead'; }
+        for (const fr of S.frigates) if (fr.side === 'E') fr.dead = true;
+        // she warped in hot: a skeleton escort, not a full deck
+        const wingN = S.diffIdx === 2 ? 5 : 4, frigN = S.diffIdx === 2 ? 2 : 1;
+        for (let sq = 0; sq < 3; sq++) for (let sl = 0; sl < wingN; sl++) S.fighters.push(makeFighter('E', sq, sl));
+        for (let i = 0; i < frigN; i++) S.frigates.push(makeFrigate('E', i));
+        evt({ type: 'stage2', x: S.E.x, y: S.E.y });
+      }
     }
 
     tickCarrier(P);
     tickCarrier(S.E);
     tickAI();
     for (const f of S.fighters) if (f.alive) tickFighter(f);
+    for (const fr of S.frigates) tickFrigate(fr);
     tickProjectiles();
 
-    // tutorial beats
-    if (S.tut === 0 && S.stats.sorties > 0) S.tut = 1;
-    else if (S.tut === 1 && S.fighters.some(f => f.side === 'P' && f.state === 'strike')) S.tut = 2;
-    else if (S.tut === 2 && S.stats.saved > 0) S.tut = 3;
+    // flight school: gated beats on ENSIGN — advance only when the player does the thing
+    if (cmd.skipTut) S.tutSkip = true;
+    if (S.tut === 0) {
+      S.tutFly += (Math.abs(cmd.thrust || 0) + Math.abs(cmd.turn || 0)) * TICK;
+      if (S.tutFly > 1.4) S.tut = 1;
+    }
+    else if (S.tut === 1 && S.stats.sorties > 0) S.tut = 2;
+    else if (S.tut === 2 && S.fighters.some(f => f.side === 'P' && f.state === 'strike')) S.tut = 3;
+    else if (S.tut === 3 && S.fighters.some(f => f.side === 'P' && f.state === 'recall')) S.tut = 4;
+    else if (S.tut === 4 && cmd.preset) S.tut = 5;
 
-    if (S.winner) S.mode = 'end';
+    if (S.winner && S.mode === 'play') {
+      S.mode = 'end';
+      const st = S.stats, won = S.winner === 'P';
+      const raw = st.dealt * 0.35 - st.taken * 0.3 + st.saved * 80 - st.lost * 120 + (won ? 1000 : 0);
+      S.score = Math.max(0, Math.round(raw * [0.7, 1, 1.4][S.diffIdx]));
+      S.perfect = won && st.lost === 0;
+      const r = S.record;
+      r.battles++; if (won) r.wins[S.diffIdx]++;
+      S.newBest = S.score > r.best;
+      if (S.newBest) r.best = S.score;
+      r.saved += st.saved; r.lost += st.lost;
+      if (S.perfect) r.perfect++;
+      try { localStorage.setItem('lev_record', JSON.stringify(r)); } catch (e) {}
+    }
   }
 
   reset(1);
   return {
     tick, state: () => S, drain: () => S.events.splice(0),
     SUBS, SUBKEYS, ROLES, SQUADS, PD_MOUNTS, BROADSIDE, DIFF, subWorld,
+    RANKS, rankFor, nextRank,
     canBroadside: c => {
       const foe = foeOf(c);
       const rel = wrapA(Math.atan2(foe.y - c.y, foe.x - c.x) - c.face);
@@ -841,6 +1015,30 @@ const Render = (() => {
   for (const r of ['INT', 'BMB', 'DEF'])
     for (const s of ['P', 'E'])
       FSPR[r + s] = buildFighterSprite(r, s);
+
+  // escort frigate hulls
+  function buildFrigate(side) {
+    const c = document.createElement('canvas'); c.width = 180; c.height = 64;
+    const x = c.getContext('2d'); x.translate(90, 32);
+    const P = side === 'P';
+    const HULLF = [[82, 0], [54, 9], [-8, 14], [-62, 11], [-76, 5], [-76, -5], [-62, -11], [-8, -14], [54, -9]];
+    x.beginPath(); HULLF.forEach((p, i) => i ? x.lineTo(p[0], p[1]) : x.moveTo(p[0], p[1])); x.closePath();
+    const gr = x.createLinearGradient(0, -14, 0, 14);
+    if (P) { gr.addColorStop(0, '#9aa4b2'); gr.addColorStop(0.5, '#6d7684'); gr.addColorStop(1, '#4a5260'); }
+    else { gr.addColorStop(0, '#7c353c'); gr.addColorStop(0.5, '#4a1e26'); gr.addColorStop(1, '#200d12'); }
+    x.fillStyle = gr; x.fill();
+    x.strokeStyle = P ? '#c05a50' : '#c25a55'; x.lineWidth = 1.6; x.stroke();
+    x.fillStyle = P ? '#525c6b' : '#301218'; x.fillRect(-18, -6, 34, 12);   // deckhouse
+    x.fillStyle = P ? '#8b97a8' : '#6a2c30'; x.fillRect(-8, -4, 16, 8);
+    x.strokeStyle = '#2c333d'; x.lineWidth = 2;                             // gun barrel
+    x.beginPath(); x.moveTo(30, 0); x.lineTo(52, 0); x.stroke();
+    x.fillStyle = '#525c6b'; x.beginPath(); x.arc(28, 0, 6, 0, TAU); x.fill();
+    x.fillStyle = '#0a0d13'; x.fillRect(-78, -6, 6, 12);                    // engines
+    x.fillStyle = P ? 'rgba(140,215,255,0.9)' : 'rgba(255,150,90,0.9)';
+    for (const ey of [-3, 3]) { x.beginPath(); x.ellipse(-77, ey, 2.5, 3, 0, 0, TAU); x.fill(); }
+    return c;
+  }
+  const FRG = { P: buildFrigate('P'), E: buildFrigate('E') };
 
   // starfield + nebulae
   const stars = [];
@@ -1009,6 +1207,8 @@ const Render = (() => {
         case 'subdown': boom(e.x || 0, e.y || 0, 20, false); if (e.side === 'P') redF = 0.5; break;
         case 'carrierdeath': boom(e.c.x, e.c.y, 60, true); boom(e.c.x + 80, e.c.y + 40, 40, true); boom(e.c.x - 90, e.c.y - 30, 40, true); break;
         case 'fighterdown': if (e.side === 'P') redF = Math.min(0.5, redF + 0.18); break;
+        case 'frigatedown': boom(e.x, e.y, 26, true); if (e.side === 'P') redF = Math.min(0.5, redF + 0.25); break;
+        case 'stage2': flashes.push({ x: e.x, y: e.y, r: 280, life: 0.5, max: 0.5, img: GLOW.red }); shake = Math.min(26, shake + 14); stage2Flash = 4.5; break;
       }
     }
   }
@@ -1055,7 +1255,24 @@ const Render = (() => {
     }
   }
 
-  function drawFighter(f) {
+  function drawFrigate(fr) {
+    const x = w2x(fr.x), y = w2y(fr.y);
+    const dw = Math.max(46, 150 * scale * 1.6), dh = dw * 64 / 180;
+    g.globalCompositeOperation = 'lighter';
+    glow(x - Math.cos(fr.face) * dw * 0.45, y - Math.sin(fr.face) * dw * 0.45,
+         10 * scale * 3 + 4, fr.side === 'P' ? GLOW.blue : GLOW.orange, 0.5);
+    g.globalCompositeOperation = 'source-over';
+    g.save(); g.translate(x, y); g.rotate(fr.face);
+    g.drawImage(FRG[fr.side], -dw / 2, -dh / 2, dw, dh);
+    g.restore();
+    if (fr.hp < fr.max) {
+      g.fillStyle = 'rgba(20,26,34,0.8)'; g.fillRect(x - 16, y - dh * 0.7 - 6, 32, 3);
+      g.fillStyle = fr.hp / fr.max > 0.5 ? '#7fe0a0' : fr.hp / fr.max > 0.25 ? '#ffd070' : '#ff6a5a';
+      g.fillRect(x - 16, y - dh * 0.7 - 6, 32 * fr.hp / fr.max, 3);
+    }
+  }
+
+  function drawFighter(f, S) {
     const x = w2x(f.x), y = w2y(f.y);
     const s = Math.max(4.5, 11 * scale * 3);
     g.globalCompositeOperation = 'lighter';
@@ -1071,6 +1288,11 @@ const Render = (() => {
     g.save(); g.translate(x, y); g.rotate(f.face);
     g.drawImage(spr, -ds / 2, -ds / 2, ds, ds);
     g.restore();
+    // your selected wing carries a marker ring
+    if (S && f.side === 'P' && (S.sel === 3 || S.sel === f.squad)) {
+      g.strokeStyle = 'rgba(160,215,255,0.35)'; g.lineWidth = 1.2;
+      g.beginPath(); g.arc(x, y, ds * 0.72, 0, TAU); g.stroke();
+    }
     // hp sliver
     if (f.hp < f.max) {
       g.fillStyle = 'rgba(20,26,34,0.8)'; g.fillRect(x - 9, y - s - 6, 18, 3);
@@ -1085,6 +1307,7 @@ const Render = (() => {
     sctx.fillStyle = col; sctx.fillRect(x, y, w * clamp(frac, 0, 1), h);
   }
   const rects = { subs: [], squads: [] };
+  let wingPrev = ['', '', ''], ticker = [], stage2Flash = 0;
 
   function drawHUD(S, now) {
     sctx.textBaseline = 'alphabetic';
@@ -1149,7 +1372,7 @@ const Render = (() => {
     sctx.fillStyle = 'rgba(16,8,10,0.78)'; sctx.fillRect(ex, ey, ew, 116);
     sctx.strokeStyle = 'rgba(220,110,100,0.45)'; sctx.strokeRect(ex + 0.5, ey + 0.5, ew, 116);
     sctx.fillStyle = '#e0a0a0'; sctx.font = 'bold 11px Consolas,monospace';
-    sctx.fillText('HOSTILE CARRIER — ' + S.diff.name, ex + 8, ey + 15);
+    sctx.fillText('HOSTILE CARRIER — ' + S.diff.name + (S.stage === 2 ? ' · 2ND CONTACT' : ''), ex + 8, ey + 15);
     bar(ex + 8, ey + 22, ew - 16, 8, E.shield / E.shieldMax, 'rgba(255,130,130,0.85)');
     bar(ex + 8, ey + 32, ew - 16, 8, E.hull / E.hullMax, 'rgba(255,90,70,0.9)');
     rects.subs.length = 0;
@@ -1208,11 +1431,59 @@ const Render = (() => {
       sctx.fillStyle = f.side === 'P' ? '#7fb8ff' : '#ff8a70';
       sctx.fillRect(fx2 - 1, fy2 - 1, 2, 2);
     }
+    for (const fr of S.frigates) {
+      if (fr.dead) continue;
+      const [fx2, fy2] = mput(fr.x, fr.y);
+      sctx.fillStyle = fr.side === 'P' ? '#9fd0ff' : '#ff9a80';
+      sctx.fillRect(fx2 - 2, fy2 - 1.5, 4, 3);
+    }
     for (const c of [P, E]) {
       const [cx2, cy2] = mput(c.x, c.y);
       sctx.save(); sctx.translate(cx2, cy2); sctx.rotate(c.face);
       sctx.fillStyle = c.side === 'P' ? '#bfe0ff' : '#ff6a5a';
       sctx.fillRect(-6, -2.5, 12, 5);
+      sctx.restore();
+    }
+
+    // ===== wing tags over each airborne cluster + status ticker =====
+    for (let sq = 0; sq < 3; sq++) {
+      const mem = S.fighters.filter(f => f.alive && f.side === 'P' && f.squad === sq);
+      const air = mem.filter(f => f.state !== 'docked');
+      if (air.length) {
+        const cx3 = air.reduce((a, f) => a + f.x, 0) / air.length;
+        const cy3 = air.reduce((a, f) => a + f.y, 0) / air.length;
+        const gx = w2x(cx3), gy = w2y(cy3) - 34;
+        if (gx > 40 && gx < W - 40 && gy > 20 && gy < H - 20) {
+          const col = ['#7fd0ff', '#ffd070', '#7fe0a0'][sq];
+          sctx.textAlign = 'center'; sctx.font = 'bold 10px Consolas,monospace';
+          sctx.fillStyle = 'rgba(6,10,16,0.7)'; sctx.fillRect(gx - 24, gy - 10, 48, 14);
+          if (S.sel === sq || S.sel === 3) { sctx.strokeStyle = col; sctx.strokeRect(gx - 24.5, gy - 10.5, 49, 15); }
+          sctx.fillStyle = col;
+          sctx.fillText('W' + (sq + 1) + ' ×' + air.length, gx, gy + 1);
+        }
+      }
+      // ticker: announce wing state changes
+      let st2 = 'DOCKED';
+      if (air.length) st2 = air.every(f => f.state === 'recall') ? 'COMING HOME' : 'ENGAGED';
+      else if (mem.length && mem.every(f => f.hp >= f.max && f.ammo >= f.ammoMax)) st2 = 'REARMED & READY';
+      if (st2 !== wingPrev[sq]) {
+        if (wingPrev[sq] !== '' && st2 !== 'DOCKED') ticker.push({ txt: 'WING ' + (sq + 1) + ' — ' + st2, life: 3 });
+        wingPrev[sq] = st2;
+      }
+    }
+    ticker = ticker.filter(m => (m.life -= 0.016) > 0);
+    if (ticker.length > 2) ticker.splice(0, ticker.length - 2);
+    sctx.textAlign = 'left'; sctx.font = 'bold 10px Consolas,monospace';
+    ticker.forEach((m, i) => {
+      sctx.fillStyle = 'rgba(159,192,221,' + Math.min(1, m.life).toFixed(2) + ')';
+      sctx.fillText('▸ ' + m.txt, 22, 148 + i * 14);
+    });
+    if (stage2Flash > 0) {
+      stage2Flash -= 0.016;
+      sctx.save(); sctx.textAlign = 'center';
+      sctx.shadowColor = 'rgba(255,80,50,0.9)'; sctx.shadowBlur = 18;
+      sctx.fillStyle = '#ffd7cd'; sctx.font = 'bold 26px Consolas,monospace';
+      sctx.fillText('SECOND CONTACT — HOSTILE REINFORCEMENT', W / 2, H * 0.3);
       sctx.restore();
     }
 
@@ -1226,18 +1497,27 @@ const Render = (() => {
     if (P.subs.weapons.disabled) warn('WEAPONS ARRAY OFFLINE', '#ffb35a');
     if (P.shield <= 0) warn('SHIELDS DOWN', '#ffd070');
 
-    // tutorial beats
-    if (S.tut < 3 && S.t < 150) {
+    // flight school (ENSIGN): gated steps while the enemy holds off
+    if (S.diffIdx === 0 && !S.tutSkip && S.tut < 5 && S.t < 75) {
       const msgs = [
-        'Press [L] to LAUNCH your selected wing from the hangar',
-        'Select a wing [1-3] and order a STRIKE with [E] — bombers gut subsystems',
-        'Watch their health bars — press [R] to RECALL them home before they die'
+        'FLIGHT SCHOOL 1/5 — fly the ship: [W] thrust · [A]/[D] turn   (the enemy is holding off)',
+        'FLIGHT SCHOOL 2/5 — press [L] to LAUNCH your selected wing from the hangar',
+        'FLIGHT SCHOOL 3/5 — select wing [2] and order a STRIKE with [E] — bombers gut subsystems',
+        'FLIGHT SCHOOL 4/5 — press [R] to RECALL a wing — docked fighters repair and rearm',
+        'FLIGHT SCHOOL 5/5 — set a power preset: [Z] weapons · [X] balanced · [C] shields · [V] hangar'
       ];
+      sctx.textAlign = 'center';
       sctx.fillStyle = 'rgba(7,12,20,0.85)';
-      const tw = 560; sctx.fillRect(W / 2 - tw / 2, 128, tw, 30);
-      sctx.strokeStyle = 'rgba(120,180,255,0.5)'; sctx.strokeRect(W / 2 - tw / 2 + 0.5, 128.5, tw, 30);
+      const tw = 620; sctx.fillRect(W / 2 - tw / 2, 128, tw, 44);
+      sctx.strokeStyle = 'rgba(120,180,255,0.5)'; sctx.strokeRect(W / 2 - tw / 2 + 0.5, 128.5, tw, 44);
       sctx.fillStyle = '#d7e3ef'; sctx.font = '12px Consolas,monospace';
-      sctx.fillText(msgs[S.tut], W / 2, 147);
+      sctx.fillText(msgs[S.tut], W / 2, 146);
+      sctx.fillStyle = '#7d93a8'; sctx.font = '10px Consolas,monospace';
+      sctx.fillText('[ESC] skip flight school', W / 2, 164);
+    } else if (S.diffIdx === 0 && S.tut === 5 && S.t < 78) {
+      sctx.textAlign = 'center';
+      sctx.fillStyle = '#8fe0a8'; sctx.font = 'bold 13px Consolas,monospace';
+      sctx.fillText('FLIGHT SCHOOL COMPLETE — the enemy is committing. Good hunting, admiral.', W / 2, 147);
     }
   }
 
@@ -1331,6 +1611,17 @@ const Render = (() => {
       sctx.fillStyle = '#ffe9b0'; sctx.font = 'bold 17px Consolas,monospace';
       sctx.fillText('press  [1] ENSIGN   [2] CAPTAIN   [3] ADMIRAL   to engage', W / 2, yy + 26);
       sctx.restore();
+      sctx.fillStyle = '#7d93a8'; sctx.font = '11px Consolas,monospace';
+      sctx.fillText('ENSIGN opens with flight school · CAPTAIN and ADMIRAL bring a SECOND carrier', W / 2, yy + 46);
+      const rec = S.record;
+      if (rec && rec.battles > 0) {
+        sctx.fillStyle = '#8fa4b8'; sctx.font = 'bold 11px Consolas,monospace';
+        sctx.fillText('SERVICE RECORD — rank ' + Sim.rankFor(rec.best) + ' · best score ' + rec.best
+          + ' · battles ' + rec.battles + ' · wins E' + rec.wins[0] + ' C' + rec.wins[1] + ' A' + rec.wins[2], W / 2, yy + 70);
+        sctx.fillStyle = '#7d93a8'; sctx.font = '11px Consolas,monospace';
+        sctx.fillText('pilots saved ' + rec.saved + ' · pilots lost ' + rec.lost
+          + (rec.perfect ? ' · ★ perfect battles ' + rec.perfect : ''), W / 2, yy + 86);
+      }
     } else if (S.mode === 'end') {
       const won = S.winner === 'P';
       sctx.fillStyle = won ? 'rgba(3,14,8,0.55)' : 'rgba(20,4,4,0.55)'; sctx.fillRect(0, 0, W, H);
@@ -1344,10 +1635,22 @@ const Render = (() => {
       sctx.fillText('battle time ' + mm + ':' + (ss < 10 ? '0' : '') + ss
         + ' · sorties ' + st.sorties + ' · fighters saved ' + st.saved + ' · lost ' + st.lost, W / 2, H * 0.36 + 34);
       sctx.fillText('damage dealt ' + Math.round(st.dealt) + ' · taken ' + Math.round(st.taken), W / 2, H * 0.36 + 56);
-      sctx.fillStyle = won && st.lost === 0 ? '#ffd978' : '#8fa4b8';
-      if (won && st.lost === 0) sctx.fillText('★ NOT ONE PILOT LEFT BEHIND ★', W / 2, H * 0.36 + 84);
+      sctx.save();
+      sctx.shadowColor = 'rgba(255,208,112,0.8)'; sctx.shadowBlur = 12;
+      sctx.fillStyle = '#ffd070'; sctx.font = 'bold 20px Consolas,monospace';
+      sctx.fillText('SCORE  ' + S.score + (S.newBest ? '   ★ NEW BEST' : ''), W / 2, H * 0.36 + 88);
+      sctx.restore();
+      let ey2 = H * 0.36 + 110;
+      if (won && st.lost === 0) {
+        sctx.fillStyle = '#ffd978'; sctx.font = 'bold 13px Consolas,monospace';
+        sctx.fillText('★ NOT ONE PILOT LEFT BEHIND ★', W / 2, ey2); ey2 += 20;
+      }
+      const nr = Sim.nextRank(S.record.best);
+      sctx.fillStyle = '#8fa4b8'; sctx.font = '11px Consolas,monospace';
+      sctx.fillText('service rank: ' + Sim.rankFor(S.record.best)
+        + (nr ? '   ·   next: ' + nr[0] + ' at ' + nr[1] : '   ·   highest rank held'), W / 2, ey2); ey2 += 26;
       sctx.fillStyle = '#eaf2fa'; sctx.font = 'bold 15px Consolas,monospace';
-      sctx.fillText('press ENTER to fight again', W / 2, H * 0.36 + 116);
+      sctx.fillText('press ENTER to fight again', W / 2, ey2);
     } else if (S.paused) {
       sctx.fillStyle = 'rgba(2,4,9,0.55)'; sctx.fillRect(0, 0, W, H);
       sctx.fillStyle = '#eaf2fa'; sctx.font = 'bold 30px Consolas,monospace';
@@ -1448,7 +1751,8 @@ const Render = (() => {
     }
     g.globalCompositeOperation = 'source-over';
 
-    for (const f of S.fighters) if (f.alive && f.state !== 'docked') drawFighter(f);
+    for (const fr of S.frigates) if (!fr.dead) drawFrigate(fr);
+    for (const f of S.fighters) if (f.alive && f.state !== 'docked') drawFighter(f, S);
 
     // particles / rings / flashes
     g.globalCompositeOperation = 'lighter';
@@ -1602,6 +1906,8 @@ const Audio2 = (() => {
         case 'order': blip(740, 0.06, 'sine', 0.05, 950); break;
         case 'blip': blip(980, 0.04, 'sine', 0.04); break;
         case 'carrierdeath': noise(2.6, 0.55, 1200, 30, pan); blip(38, 2.6, 'sine', 0.4, 16, pan); break;
+        case 'frigatedown': noise(0.9, 0.35, 900, 45, pan); blip(70, 0.9, 'sine', 0.2, 26, pan); break;
+        case 'stage2': blip(880, 0.5, 'square', 0.09, 870); blip(660, 0.7, 'square', 0.09, 650); noise(1.4, 0.3, 900, 60); break;
         case 'fighterdown': blip(300, 0.25, 'sawtooth', 0.05, 70, pan); break;
         case 'battle': blip(340, 0.4, 'sine', 0.07, 500); break;
       }
@@ -1620,7 +1926,7 @@ const Input = (() => {
   const held = new Set();
   let launch = false, order = null, sel = null, cycleSub = false, preset = null,
       broadside = false, spinal = false, missile = false, pause = false, restart = false, start = null,
-      setSub = null;
+      setSub = null, skipTut = false;
   window.addEventListener('keydown', e => {
     Audio2.ensure();
     if ([' ', 'Tab'].includes(e.key) || e.key.startsWith('Arrow')) e.preventDefault();
@@ -1647,6 +1953,7 @@ const Input = (() => {
     if (k === 't') missile = true;
     if (k === 'p') pause = true;
     if (k === 'enter') restart = true;
+    if (k === 'escape') skipTut = true;
   });
   window.addEventListener('keyup', e => held.delete(e.key.toLowerCase()));
   window.addEventListener('blur', () => held.clear());
@@ -1671,10 +1978,10 @@ const Input = (() => {
       thrust: (held.has('w') ? 1 : 0) + (held.has('s') ? -0.6 : 0),
       turn: (held.has('a') ? -1 : 0) + (held.has('d') ? 1 : 0),
       launch, order, sel, cycleSub, setSub, preset,
-      broadside, spinal, missile, wmgHold: held.has('h'), pause, restart, start
+      broadside, spinal, missile, wmgHold: held.has('h'), pause, restart, start, skipTut
     };
     launch = false; order = null; sel = null; cycleSub = false; setSub = null;
-    preset = null; broadside = false; spinal = false; missile = false; pause = false; restart = false; start = null;
+    preset = null; broadside = false; spinal = false; missile = false; pause = false; restart = false; start = null; skipTut = false;
     return cmd;
   }
   return { consume };
