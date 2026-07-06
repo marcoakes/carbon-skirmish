@@ -1,0 +1,1324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LEVIATHANS — a capital carrier duel</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html,body{margin:0;padding:0;background:#030509;overflow:hidden;height:100%}
+  canvas{display:block;width:100vw;height:100vh;cursor:crosshair;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+"use strict";
+/* =====================================================================
+   LEVIATHANS — a capital-class carrier duel
+   (companion piece to STAR BLAZERS: Carbon Skirmish — same DNA:
+    a fixed-tick simulation that owns all state, a renderer that only
+    reads it, and WebAudio synthesis for every sound. One file, no deps.)
+
+   SYSTEMS INDEX
+     [1] constants & helpers
+     [2] SIM — carriers, subsystems, power, fighters, squadrons,
+               projectiles, point defense, repair bays, enemy admiral AI
+     [3] RENDER — procedural carrier hulls, starfield, bloom compositor,
+               effects, command-bridge HUD, minimap, overlays
+     [4] AUDIO — procedural weapons, alarms, chimes, tension layer
+     [5] INPUT & MAIN LOOP
+   ===================================================================== */
+
+/* ============================ [1] CORE ============================ */
+const TICK = 1 / 60, TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const wrapA = a => { while (a > Math.PI) a -= TAU; while (a < -Math.PI) a += TAU; return a; };
+const dist = (a, b, c, d) => Math.hypot(c - a, d - b);
+
+/* ============================ [2] SIM ============================ */
+const Sim = (() => {
+
+  // ---- subsystem layout (hull-local, nose = +x, carrier ~460m long) ----
+  const SUBS = {
+    hangar:    { x: -40, y: 62, r: 46, label: 'HANGAR' },
+    engines:   { x: -195, y: 0, r: 44, label: 'ENGINES' },
+    shieldgen: { x: 55, y: -58, r: 40, label: 'SHIELD GEN' },
+    weapons:   { x: 130, y: 34, r: 40, label: 'WEAPONS' }
+  };
+  const SUBKEYS = ['hangar', 'engines', 'shieldgen', 'weapons'];
+  const PD_MOUNTS = [[150, 62], [150, -62], [0, 78], [0, -78], [-125, 66], [-125, -66]];
+  const BROADSIDE = [[110, 70], [40, 74], [-40, 74], [-115, 70]];   // mirrored for port
+
+  // ---- squadron doctrine: three wings, three jobs ----
+  const ROLES = {
+    INT: { hp: 55, spd: 305, turn: 4.2, dmgF: 7, dmgC: 3, range: 170, rof: 0.35, ammo: 34, label: 'INTERCEPTOR' },
+    BMB: { hp: 72, spd: 215, turn: 2.8, dmgF: 2, dmgC: 17, range: 285, rof: 0.9, ammo: 18, label: 'BOMBER' },
+    DEF: { hp: 88, spd: 265, turn: 3.6, dmgF: 5, dmgC: 2, range: 190, rof: 0.45, ammo: 30, label: 'DEFENDER' }
+  };
+  const SQUADS = ['INT', 'BMB', 'DEF'];
+
+  const DIFF = [
+    { name: 'ENSIGN', think: 1.3, repair: 0.8, aggro: 0.8, pdAcc: 0.45, dmgMul: 0.6 },
+    { name: 'CAPTAIN', think: 0.8, repair: 1.0, aggro: 1.0, pdAcc: 0.62, dmgMul: 0.95 },
+    { name: 'ADMIRAL', think: 0.45, repair: 1.25, aggro: 1.25, pdAcc: 0.78, dmgMul: 1.2 }
+  ];
+
+  let S = null, nextId = 1;
+  const R = Math.random;   // no replay requirement here: honest dice
+
+  function makeCarrier(side, x, y, face) {
+    const c = {
+      side, x, y, vx: 0, vy: 0, face, radius: 150,
+      hull: 2600, hullMax: 2600, shield: 800, shieldMax: 800,
+      subs: {}, power: { shields: 2, weapons: 2, engines: 2, hangar: 2 },
+      broadCd: 0, spinalCd: 0, launchCd: 0, pdCds: PD_MOUNTS.map(() => R() * 0.5),
+      targetSub: 'hangar',   // which enemy subsystem the capital guns hammer
+      dead: false
+    };
+    for (const k of SUBKEYS) c.subs[k] = { hp: 350, max: 350, disabled: false };
+    return c;
+  }
+
+  function makeFighter(side, squad, slot) {
+    const role = ROLES[SQUADS[squad]];
+    return {
+      id: nextId++, side, squad, slot, role: SQUADS[squad],
+      x: 0, y: 0, vx: 0, vy: 0, face: 0,
+      hp: role.hp, max: role.hp, ammo: role.ammo, ammoMax: role.ammo,
+      state: 'docked', order: 'defend', gunCd: R(), runT: 0, tId: 0,
+      repairing: false, alive: true
+    };
+  }
+
+  function reset(diffIdx) {
+    nextId = 1;
+    const di = clamp(diffIdx == null ? 1 : diffIdx, 0, 2);
+    S = {
+      mode: 'title', t: 0, diff: DIFF[di], diffIdx: di,
+      P: makeCarrier('P', -900, 0, 0),
+      E: makeCarrier('E', 900, 0, Math.PI),
+      fighters: [], projectiles: [], events: [],
+      sel: 0,                              // selected squadron (0..2), 3 = all
+      aiThinkT: 0, aiRecallT: 0,
+      stats: { lost: 0, saved: 0, dealt: 0, taken: 0, sorties: 0 },
+      paused: false, winner: null, endT: 0,
+      tut: 0, tutT: 0
+    };
+    for (let sq = 0; sq < 3; sq++)
+      for (let sl = 0; sl < 4; sl++) {
+        S.fighters.push(makeFighter('P', sq, sl));
+        S.fighters.push(makeFighter('E', sq, sl));
+      }
+    return S;
+  }
+
+  const foeOf = c => (c.side === 'P' ? S.E : S.P);
+  const carrierOf = f => (f.side === 'P' ? S.P : S.E);
+  const evt = e => S.events.push(e);
+  const subWorld = (c, k) => {
+    const o = SUBS[k], ca = Math.cos(c.face), sa = Math.sin(c.face);
+    return { x: c.x + o.x * ca - o.y * sa, y: c.y + o.x * sa + o.y * ca };
+  };
+
+  // ---- damage into a carrier: shield, then the nearest subsystem, then hull ----
+  function hitCarrier(c, dmg, x, y, forceSub, pierce) {
+    if (c.dead) return;
+    if (c.side === 'P') { dmg *= S.diff.dmgMul; S.stats.taken += dmg; }
+    else S.stats.dealt += dmg;
+    if (c.shield > 0) {
+      if (pierce) {   // torpedoes detonate on contact: shields only blunt them
+        c.shield = Math.max(0, c.shield - dmg * 0.6);
+        dmg *= 0.4;
+        evt({ type: 'shield', c, ang: Math.atan2(y - c.y, x - c.x) });
+      } else {
+        c.shield = Math.max(0, c.shield - dmg);
+        evt({ type: 'shield', c, ang: Math.atan2(y - c.y, x - c.x) });
+        return;
+      }
+    }
+    let key = forceSub || null;
+    if (!key) {
+      let bd = 85;
+      for (const k of SUBKEYS) {
+        const p = subWorld(c, k);
+        const d = dist(p.x, p.y, x, y);
+        if (d < bd) { bd = d; key = k; }
+      }
+    }
+    if (key && !c.subs[key].disabled) {
+      const sub = c.subs[key];
+      sub.hp = Math.max(0, sub.hp - dmg * (forceSub ? 0.95 : 0.6));
+      c.hull -= dmg * 0.6;
+      if (sub.hp <= 0 && !sub.disabled) {
+        sub.disabled = true;
+        evt({ type: 'subdown', side: c.side, key, x, y });
+      }
+    } else c.hull -= dmg;
+    evt({ type: 'armorhit', x, y, big: dmg > 40 });
+    if (c.hull <= 0 && !c.dead) {
+      c.dead = true; c.hull = 0;
+      S.winner = c.side === 'E' ? 'P' : 'E';
+      S.endT = S.t;
+      evt({ type: 'carrierdeath', c });
+    }
+  }
+
+  // ---- power: 8 pips over 4 systems; presets are the tactical dial ----
+  const PRESETS = {
+    weapons: { shields: 1, weapons: 4, engines: 1, hangar: 2 },
+    balanced: { shields: 2, weapons: 2, engines: 2, hangar: 2 },
+    shields: { shields: 4, weapons: 1, engines: 1, hangar: 2 },
+    hangar: { shields: 2, weapons: 1, engines: 1, hangar: 4 }
+  };
+  const pw = (c, k) => 0.55 + 0.225 * c.power[k];   // 0 pips ≈ 55%, 4 pips ≈ 145%
+
+  // ---- carrier per-tick upkeep: shields, repairs, PD ----
+  function tickCarrier(c) {
+    if (c.dead) return;
+    const foe = foeOf(c);
+    // shields recharge only while the generator lives
+    if (!c.subs.shieldgen.disabled)
+      c.shield = Math.min(c.shieldMax, c.shield + 7 * pw(c, 'shields') * TICK);
+    // disabled subsystems slowly patch back toward action if the hangar crews live
+    for (const k of SUBKEYS) {
+      const sub = c.subs[k];
+      if (sub.hp < sub.max * 0.6 && !c.subs.hangar.disabled)
+        sub.hp += 1.3 * pw(c, 'hangar') * (c.side === 'E' ? S.diff.repair : 1) * TICK;
+      if (sub.disabled && sub.hp > sub.max * 0.28) {
+        sub.disabled = false;
+        evt({ type: 'subup', side: c.side, key: k });
+      }
+    }
+    // hangar repair bays: 4 docked fighters healed concurrently (triage = dock order)
+    if (!c.subs.hangar.disabled) {
+      let bays = 4;
+      for (const f of S.fighters) {
+        if (!f.alive || f.side !== c.side || f.state !== 'docked') continue;
+        f.repairing = false;
+        if (bays > 0 && (f.hp < f.max || f.ammo < f.ammoMax)) {
+          bays--;
+          f.repairing = true;
+          const rate = 7 * pw(c, 'hangar') * (c.side === 'E' ? S.diff.repair : 1);
+          const was = f.hp;
+          f.hp = Math.min(f.max, f.hp + rate * TICK);
+          f.ammo = Math.min(f.ammoMax, f.ammo + 6 * TICK);
+          if (was < f.max && f.hp >= f.max && f.ammo >= f.ammoMax)
+            evt({ type: 'ready', side: c.side });
+        }
+      }
+    }
+    // point defense: auto-fire at nearby enemy fighters and torpedoes
+    if (!c.subs.weapons.disabled) {
+      const rate = 0.6 / pw(c, 'weapons');
+      const acc = (c.side === 'E' ? S.diff.pdAcc : 0.55) * 0.72 * (0.75 + 0.12 * c.power.weapons);
+      for (let m = 0; m < PD_MOUNTS.length; m++) {
+        c.pdCds[m] -= TICK;
+        if (c.pdCds[m] > 0) continue;
+        const ca = Math.cos(c.face), sa = Math.sin(c.face);
+        const mx = c.x + PD_MOUNTS[m][0] * ca - PD_MOUNTS[m][1] * sa;
+        const my = c.y + PD_MOUNTS[m][0] * sa + PD_MOUNTS[m][1] * ca;
+        let tgt = null, bd = 370, isTorp = false;
+        for (const pr of S.projectiles)
+          if (pr.kind === 'storp' && pr.side !== c.side) {
+            const d = dist(mx, my, pr.x, pr.y);
+            if (d < bd) { bd = d; tgt = pr; isTorp = true; }
+          }
+        if (!tgt) for (const f of S.fighters) {
+          if (!f.alive || f.side === c.side || f.state === 'docked') continue;
+          const d = dist(mx, my, f.x, f.y);
+          if (d < bd) { bd = d; tgt = f; isTorp = false; }
+        }
+        if (tgt) {
+          c.pdCds[m] = rate * (0.7 + R() * 0.6);
+          evt({ type: 'pd', x: mx, y: my, tx: tgt.x, ty: tgt.y });
+          if (R() < acc) {
+            if (isTorp) { tgt.hp -= 8; if (tgt.hp <= 0) { tgt.dead = true; evt({ type: 'boom', x: tgt.x, y: tgt.y, r: 10 }); } }
+            else {
+              tgt.hp -= 6;
+              evt({ type: 'fhit', x: tgt.x, y: tgt.y });
+              if (tgt.hp <= 0) killFighter(tgt);
+            }
+          }
+        } else c.pdCds[m] = 0.2;
+      }
+    }
+    c.broadCd -= TICK; c.spinalCd -= TICK; c.launchCd -= TICK;
+  }
+
+  function killFighter(f) {
+    f.alive = false; f.state = 'dead';
+    evt({ type: 'boom', x: f.x, y: f.y, r: 12 });
+    evt({ type: 'fighterdown', side: f.side });
+    if (f.side === 'P') S.stats.lost++;
+  }
+
+  // ---- fighter brains: steering + role behaviors ----
+  function steer(f, tx, ty, arrive, spdMul) {
+    const role = ROLES[f.role];
+    let dx = tx - f.x, dy = ty - f.y;
+    const d = Math.hypot(dx, dy) || 1;
+    let spd = role.spd * (spdMul || 1);
+    if (arrive && d < 180) spd *= d / 180;
+    dx = dx / d * spd; dy = dy / d * spd;
+    const k = 1 - Math.exp(-2.6 * TICK);
+    f.vx += (dx - f.vx) * k; f.vy += (dy - f.vy) * k;
+    f.x += f.vx * TICK; f.y += f.vy * TICK;
+    if (Math.hypot(f.vx, f.vy) > 12) f.face = Math.atan2(f.vy, f.vx);
+  }
+  function separation(f) {
+    let ox = 0, oy = 0;
+    for (const g of S.fighters) {
+      if (g === f || !g.alive || g.side !== f.side || g.state === 'docked') continue;
+      const d = dist(f.x, f.y, g.x, g.y);
+      if (d < 34 && d > 0.01) { ox += (f.x - g.x) / d * (34 - d) * 3; oy += (f.y - g.y) / d * (34 - d) * 3; }
+    }
+    return [ox, oy];
+  }
+  function fireF(f, tx, ty, dmg, kind) {
+    const a = Math.atan2(ty - f.y, tx - f.x) + (R() - 0.5) * 0.09;
+    S.projectiles.push({
+      kind, side: f.side, x: f.x, y: f.y,
+      vx: Math.cos(a) * 720 + f.vx * 0.3, vy: Math.sin(a) * 720 + f.vy * 0.3,
+      dmg, life: 0.55
+    });
+    f.ammo--; f.gunCd = ROLES[f.role].rof;
+    evt({ type: 'pew', x: f.x, y: f.y, side: f.side });
+  }
+
+  function tickFighter(f) {
+    const own = carrierOf(f), foe = foeOf(own);
+    const role = ROLES[f.role];
+    if (f.state === 'docked') { f.x = own.x; f.y = own.y; return; }
+    f.gunCd -= TICK;
+
+    // recall: fly home and survive the trip — the signature tension
+    if (f.state === 'recall') {
+      const h = subWorld(own, 'hangar');
+      steer(f, h.x, h.y, true, 1.15);
+      if (dist(f.x, f.y, h.x, h.y) < 52 && !own.subs.hangar.disabled) {
+        f.state = 'docked'; f.vx = f.vy = 0;
+        evt({ type: 'dock', side: f.side, x: h.x, y: h.y });
+        if (f.side === 'P') S.stats.saved++;
+      }
+      return;
+    }
+    if (f.state === 'launch') {
+      f.runT -= TICK;
+      const a = own.face + (f.side === 'P' ? 0.9 : -0.9);
+      steer(f, own.x + Math.cos(a) * 420, own.y + Math.sin(a) * 420, false, 1);
+      if (f.runT <= 0) f.state = f.order;
+      return;
+    }
+
+    // out of ammo: no teeth — loiter defensively so the commander notices
+    const dry = f.ammo <= 0;
+    const [sx, sy] = separation(f);
+
+    // pick a dogfight target
+    let tgtF = null, bd = f.role === 'BMB' ? 260 : 640;
+    for (const g of S.fighters) {
+      if (!g.alive || g.side === f.side || g.state === 'docked') continue;
+      const d = dist(f.x, f.y, g.x, g.y);
+      if (d < bd) { bd = d; tgtF = g; }
+    }
+
+    let goalX = own.x, goalY = own.y, engaged = false;
+    const orderNow = f.order;
+    if (orderNow === 'strike' && !dry) {
+      // strafe the ordered enemy subsystem: run in, unload, break away
+      const tp = subWorld(foe, own.targetSub);
+      if (f.runT > 0) {   // breakaway leg
+        f.runT -= TICK;
+        goalX = f.x + Math.cos(f.face) * 500; goalY = f.y + Math.sin(f.face) * 500;
+      } else {
+        goalX = tp.x; goalY = tp.y;
+        const d = dist(f.x, f.y, tp.x, tp.y);
+        if (d < role.range + 60 && f.gunCd <= 0) {
+          fireF(f, tp.x, tp.y, role.dmgC, 'cslug');
+          if (R() < 0.3) f.runT = 1.6;   // peel off after the pass
+        }
+      }
+      engaged = true;
+      // interceptors harass anyone in the way
+      if (f.role !== 'BMB' && tgtF && dist(f.x, f.y, tgtF.x, tgtF.y) < role.range && f.gunCd <= 0)
+        fireF(f, tgtF.x + tgtF.vx * 0.15, tgtF.y + tgtF.vy * 0.15, role.dmgF, 'fslug');
+    } else if (orderNow === 'intercept' && tgtF && !dry) {
+      goalX = tgtF.x + tgtF.vx * 0.25; goalY = tgtF.y + tgtF.vy * 0.25;
+      engaged = true;
+      if (dist(f.x, f.y, tgtF.x, tgtF.y) < role.range && f.gunCd <= 0)
+        fireF(f, goalX, goalY, role.dmgF, 'fslug');
+    } else if (orderNow === 'defend') {
+      // hold a screen around our own carrier; engage what comes close
+      const ha = (f.id * 2.399) % TAU;
+      goalX = own.x + Math.cos(ha + S.t * 0.15) * 300;
+      goalY = own.y + Math.sin(ha + S.t * 0.15) * 300;
+      if (tgtF && dist(own.x, own.y, tgtF.x, tgtF.y) < 720 && !dry) {
+        goalX = tgtF.x; goalY = tgtF.y;
+        if (dist(f.x, f.y, tgtF.x, tgtF.y) < role.range && f.gunCd <= 0)
+          fireF(f, tgtF.x + tgtF.vx * 0.2, tgtF.y + tgtF.vy * 0.2, role.dmgF, 'fslug');
+      }
+      // defenders also gun down incoming torpedoes
+      if (f.role === 'DEF' && !dry && f.gunCd <= 0)
+        for (const pr of S.projectiles)
+          if (pr.kind === 'storp' && pr.side !== f.side && dist(f.x, f.y, pr.x, pr.y) < role.range) {
+            fireF(f, pr.x, pr.y, 6, 'fslug');
+            pr.hp -= 6;
+            if (pr.hp <= 0) { pr.dead = true; evt({ type: 'boom', x: pr.x, y: pr.y, r: 10 }); }
+            break;
+          }
+    } else {   // regroup (or dry): form on the carrier's flank
+      const ha = own.face + Math.PI / 2 + (f.squad - 1) * 0.5;
+      goalX = own.x + Math.cos(ha) * 260 + (f.slot - 1.5) * 30;
+      goalY = own.y + Math.sin(ha) * 260;
+    }
+    steer(f, goalX + sx, goalY + sy, !engaged, engaged ? 1 : 0.85);
+  }
+
+  // ---- projectiles: fighter slugs, capital shells, spinal torpedoes ----
+  function tickProjectiles() {
+    for (const pr of S.projectiles) {
+      if (pr.dead) continue;
+      if (pr.kind === 'storp') {
+        const foe = pr.side === 'P' ? S.E : S.P;
+        const tp = subWorld(foe, pr.sub);
+        const want = Math.atan2(tp.y - pr.y, tp.x - pr.x);
+        const cur = Math.atan2(pr.vy, pr.vx);
+        const na = cur + clamp(wrapA(want - cur), -1.4 * TICK, 1.4 * TICK);
+        pr.vx = Math.cos(na) * 150; pr.vy = Math.sin(na) * 150;
+        pr.x += pr.vx * TICK; pr.y += pr.vy * TICK;
+        pr.life -= TICK;
+        if (dist(pr.x, pr.y, tp.x, tp.y) < 46) {
+          pr.dead = true;
+          evt({ type: 'boom', x: pr.x, y: pr.y, r: 26, big: true });
+          hitCarrier(foe, pr.dmg, pr.x, pr.y, pr.sub, true);
+        } else if (pr.life <= 0) pr.dead = true;
+        continue;
+      }
+      pr.x += pr.vx * TICK; pr.y += pr.vy * TICK;
+      pr.life -= TICK;
+      if (pr.life <= 0) { pr.dead = true; continue; }
+      // vs fighters
+      if (pr.kind === 'fslug' || pr.kind === 'shell') {
+        for (const f of S.fighters) {
+          if (!f.alive || f.side === pr.side || f.state === 'docked') continue;
+          if (dist(pr.x, pr.y, f.x, f.y) < (pr.kind === 'shell' ? 20 : 13)) {
+            pr.dead = true;
+            f.hp -= pr.dmg;
+            evt({ type: 'fhit', x: f.x, y: f.y });
+            if (f.hp <= 0) killFighter(f);
+            break;
+          }
+        }
+        if (pr.dead) continue;
+      }
+      // vs carriers
+      const foe = pr.side === 'P' ? S.E : S.P;
+      if (!foe.dead && dist(pr.x, pr.y, foe.x, foe.y) < foe.radius) {
+        pr.dead = true;
+        hitCarrier(foe, pr.dmg, pr.x, pr.y);
+      }
+    }
+    S.projectiles = S.projectiles.filter(p => !p.dead);
+  }
+
+  // ---- capital fire control ----
+  function fireBroadside(c) {
+    if (c.dead || c.subs.weapons.disabled || c.broadCd > 0) return false;
+    const foe = foeOf(c);
+    const toFoe = Math.atan2(foe.y - c.y, foe.x - c.x);
+    const rel = wrapA(toFoe - c.face);
+    const flank = rel > 0 ? 1 : -1;             // starboard or port battery
+    if (Math.abs(Math.abs(rel) - Math.PI / 2) > 0.95) return false;   // must present the flank
+    if (dist(c.x, c.y, foe.x, foe.y) > 1500) return false;
+    c.broadCd = 3.6 / pw(c, 'weapons');
+    const ca = Math.cos(c.face), sa = Math.sin(c.face);
+    BROADSIDE.forEach((b, i) => {
+      const bx = c.x + b[0] * ca - b[1] * flank * sa;
+      const by = c.y + b[0] * sa + b[1] * flank * ca;
+      const a = Math.atan2(foe.y - by, foe.x - bx) + (R() - 0.5) * 0.06;
+      S.projectiles.push({
+        kind: 'shell', side: c.side, x: bx, y: by,
+        vx: Math.cos(a) * 620, vy: Math.sin(a) * 620,
+        dmg: 48 * pw(c, 'weapons'), life: 2.8, delay: i * 0.05
+      });
+      evt({ type: 'broadside', x: bx, y: by, i });
+    });
+    return true;
+  }
+  function fireSpinal(c) {
+    if (c.dead || c.subs.weapons.disabled || c.spinalCd > 0) return false;
+    const foe = foeOf(c);
+    if (dist(c.x, c.y, foe.x, foe.y) > 2100) return false;
+    c.spinalCd = 24;
+    for (let i = 0; i < 3; i++) {
+      const a = c.face + (i - 1) * 0.14;
+      S.projectiles.push({
+        kind: 'storp', side: c.side, sub: c.targetSub, hp: 45,
+        x: c.x + Math.cos(c.face) * 240, y: c.y + Math.sin(c.face) * 240,
+        vx: Math.cos(a) * 150, vy: Math.sin(a) * 150,
+        dmg: 135, life: 22
+      });
+    }
+    evt({ type: 'spinal', x: c.x, y: c.y, side: c.side });
+    return true;
+  }
+  function launchSquad(c, sq) {
+    if (c.dead || c.subs.hangar.disabled || c.launchCd > 0) return false;
+    let any = false;
+    for (const f of S.fighters) {
+      if (!f.alive || f.side !== c.side || f.squad !== sq || f.state !== 'docked') continue;
+      if (f.hp < f.max * 0.35) continue;   // too broken to fly
+      const h = subWorld(c, 'hangar');
+      f.x = h.x + (R() - 0.5) * 30; f.y = h.y + (R() - 0.5) * 30;
+      f.vx = c.vx; f.vy = c.vy;
+      f.state = 'launch'; f.runT = 1.1 + f.slot * 0.35;
+      f.order = f.role === 'BMB' ? 'strike' : f.role === 'DEF' ? 'defend' : 'intercept';
+      any = true;
+      if (c.side === 'P') S.stats.sorties++;
+    }
+    if (any) {
+      c.launchCd = 4 / pw(c, 'hangar');
+      evt({ type: 'launch', side: c.side });
+    }
+    return any;
+  }
+  function orderSquad(c, sq, order) {
+    let any = false;
+    for (const f of S.fighters) {
+      if (!f.alive || f.side !== c.side || f.state === 'docked') continue;
+      if (sq !== 3 && f.squad !== sq) continue;
+      if (order === 'recall') f.state = 'recall';
+      else { f.order = order; if (f.state !== 'launch') f.state = order; }
+      any = true;
+    }
+    if (any && c.side === 'P') evt({ type: 'order', order });
+    return any;
+  }
+
+  // ---- the enemy admiral: a mirror who actually thinks ----
+  function tickAI() {
+    const E = S.E, P = S.P;
+    if (E.dead) return;
+    S.aiThinkT -= TICK;
+    // continuous helm: hold a broadside band, kite when hurt, press when ahead
+    const d = dist(E.x, E.y, P.x, P.y);
+    const hurt = E.hull / E.hullMax, ahead = (E.hull / E.hullMax) - (P.hull / P.hullMax);
+    let want = 820;
+    if (hurt < 0.4) want = 1250;
+    else if (ahead > 0.15) want = 680 / S.diff.aggro;
+    const toP = Math.atan2(P.y - E.y, P.x - E.x);
+    // face so P sits on our broadside (±90°)
+    const flank = wrapA(toP - E.face) > 0 ? 1 : -1;
+    const wantFace = toP - flank * Math.PI / 2;
+    const spd = 55 * pw(E, 'engines') * (E.subs.engines.disabled ? 0.18 : 1);
+    E.face += clamp(wrapA(wantFace - E.face), -0.5 * TICK, 0.5 * TICK);
+    const push = d > want + 80 ? 1 : d < want - 80 ? -1 : 0;
+    E.vx += (Math.cos(toP) * push * spd - E.vx) * (1 - Math.exp(-0.5 * TICK));
+    E.vy += (Math.sin(toP) * push * spd - E.vy) * (1 - Math.exp(-0.5 * TICK));
+    E.x += E.vx * TICK; E.y += E.vy * TICK;
+
+    if (S.aiThinkT > 0) return;
+    S.aiThinkT = S.diff.think;
+    // power doctrine
+    if (E.shield < E.shieldMax * 0.25) E.power = { ...PRESETS.shields };
+    else if (SUBKEYS.some(k => E.subs[k].hp < E.subs[k].max * 0.35)) E.power = { ...PRESETS.hangar };
+    else if (P.shield <= 0) E.power = { ...PRESETS.weapons };
+    else E.power = { ...PRESETS.balanced };
+    // target the player's soft spots: hangar first, always
+    E.targetSub = !P.subs.hangar.disabled && P.subs.hangar.hp > 0 ? 'hangar'
+      : !P.subs.weapons.disabled ? 'weapons' : 'shieldgen';
+    // capital fire
+    fireBroadside(E);
+    if (E.spinalCd <= 0 && R() < 0.6 * S.diff.aggro) fireSpinal(E);
+    // squadron management: launch what's ready, recall the dying
+    for (let sq = 0; sq < 3; sq++) {
+      const docked = S.fighters.filter(f => f.alive && f.side === 'E' && f.squad === sq && f.state === 'docked');
+      const ready = docked.filter(f => f.hp > f.max * 0.8);
+      if (ready.length >= 2) launchSquad(E, sq);
+    }
+    for (const f of S.fighters) {
+      if (!f.alive || f.side !== 'E' || f.state === 'docked' || f.state === 'recall') continue;
+      if (f.hp < f.max * 0.34 || f.ammo <= 0) f.state = 'recall';   // the AI feels each loss
+    }
+    // threat response: player fighters near our hull → scramble defense
+    const nearThreats = S.fighters.filter(f => f.alive && f.side === 'P' && f.state !== 'docked'
+      && dist(f.x, f.y, E.x, E.y) < 700).length;
+    if (nearThreats >= 3) orderSquad(E, 3, 'intercept');
+    else {
+      orderSquad(E, 0, 'intercept');
+      orderSquad(E, 1, 'strike');
+      orderSquad(E, 2, R() < 0.4 * S.diff.aggro ? 'strike' : 'defend');
+    }
+  }
+
+  // ---- master tick ----
+  function tick(cmd) {
+    if (S.mode === 'title') {
+      if (cmd.start != null) { reset(cmd.start); S.mode = 'play'; evt({ type: 'battle' }); }
+      return;
+    }
+    if (S.mode === 'end') {
+      if (cmd.restart) { const d = S.diffIdx; reset(d); S.mode = 'play'; evt({ type: 'battle' }); }
+      return;
+    }
+    if (cmd.pause) S.paused = !S.paused;
+    if (S.paused) return;
+    S.t += TICK;
+    const P = S.P;
+
+    // ---- player helm: weighty, momentum, no instant stops ----
+    if (!P.dead) {
+      const spd = 55 * pw(P, 'engines') * (P.subs.engines.disabled ? 0.18 : 1);
+      P.face += (cmd.turn || 0) * 0.55 * pw(P, 'engines') * (P.subs.engines.disabled ? 0.3 : 1) * TICK;
+      if (cmd.thrust) {
+        const k = 1 - Math.exp(-0.5 * TICK);
+        P.vx += (Math.cos(P.face) * spd * cmd.thrust - P.vx) * k;
+        P.vy += (Math.sin(P.face) * spd * cmd.thrust - P.vy) * k;
+      } else { P.vx *= 1 - 0.15 * TICK; P.vy *= 1 - 0.15 * TICK; }
+      P.x += P.vx * TICK; P.y += P.vy * TICK;
+      if (cmd.preset) P.power = { ...PRESETS[cmd.preset] };
+      if (cmd.cycleSub) {
+        const i = SUBKEYS.indexOf(P.targetSub);
+        P.targetSub = SUBKEYS[(i + 1) % 4];
+        evt({ type: 'blip' });
+      }
+      if (cmd.setSub) { P.targetSub = cmd.setSub; evt({ type: 'blip' }); }
+      if (cmd.sel != null) { S.sel = cmd.sel; evt({ type: 'blip' }); }
+      if (cmd.launch) launchSquad(P, S.sel === 3 ? 0 : S.sel) || (S.sel === 3 && (launchSquad(P, 1), launchSquad(P, 2)));
+      if (cmd.order) orderSquad(P, S.sel, cmd.order);
+      if (cmd.broadside) fireBroadside(P);
+      if (cmd.spinal) fireSpinal(P);
+    }
+
+    tickCarrier(P);
+    tickCarrier(S.E);
+    tickAI();
+    for (const f of S.fighters) if (f.alive) tickFighter(f);
+    tickProjectiles();
+
+    // tutorial beats
+    if (S.tut === 0 && S.stats.sorties > 0) S.tut = 1;
+    else if (S.tut === 1 && S.fighters.some(f => f.side === 'P' && f.state === 'strike')) S.tut = 2;
+    else if (S.tut === 2 && S.stats.saved > 0) S.tut = 3;
+
+    if (S.winner) S.mode = 'end';
+  }
+
+  reset(1);
+  return {
+    tick, state: () => S, drain: () => S.events.splice(0),
+    SUBS, SUBKEYS, ROLES, SQUADS, PD_MOUNTS, BROADSIDE, DIFF, subWorld,
+    canBroadside: c => {
+      const foe = foeOf(c);
+      const rel = wrapA(Math.atan2(foe.y - c.y, foe.x - c.x) - c.face);
+      return Math.abs(Math.abs(rel) - Math.PI / 2) <= 0.95 && dist(c.x, c.y, foe.x, foe.y) <= 1500;
+    }
+  };
+})();
+
+/* =========================== [3] RENDER =========================== */
+const Render = (() => {
+  const cv = document.getElementById('cv');
+  const sctx = cv.getContext('2d');
+  const wcv = document.createElement('canvas'), g = wcv.getContext('2d');
+  const bA = document.createElement('canvas'), bactx = bA.getContext('2d');
+  const bB = document.createElement('canvas'), bbctx = bB.getContext('2d');
+  let W = 0, H = 0, DPR = 1, scale = 0.4, cam = { x: 0, y: 0 };
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = wcv.width = Math.round(W * DPR);
+    cv.height = wcv.height = Math.round(H * DPR);
+    bA.width = cv.width >> 2; bA.height = cv.height >> 2;
+    bB.width = cv.width >> 3; bB.height = cv.height >> 3;
+  }
+  window.addEventListener('resize', resize); resize();
+
+  // glow sprites (the whole additive look)
+  function mkGlow(r, gg, b) {
+    const c = document.createElement('canvas'); c.width = c.height = 128;
+    const x = c.getContext('2d');
+    const gr = x.createRadialGradient(64, 64, 0, 64, 64, 64);
+    gr.addColorStop(0, `rgba(${r},${gg},${b},1)`);
+    gr.addColorStop(0.3, `rgba(${r},${gg},${b},0.45)`);
+    gr.addColorStop(1, `rgba(${r},${gg},${b},0)`);
+    x.fillStyle = gr; x.fillRect(0, 0, 128, 128);
+    return c;
+  }
+  const GLOW = { blue: mkGlow(110, 190, 255), red: mkGlow(255, 95, 70), gold: mkGlow(255, 210, 120), white: mkGlow(230, 240, 255), teal: mkGlow(90, 255, 210), orange: mkGlow(255, 160, 70) };
+  const glow = (x, y, r, img, a) => { if (a <= 0 || r <= 0) return; g.globalAlpha = Math.min(1, a); g.drawImage(img, x - r, y - r, r * 2, r * 2); g.globalAlpha = 1; };
+
+  // starfield + nebulae
+  const stars = [];
+  { let s = 1234321; const rnd = () => (s = s * 16807 % 2147483647) / 2147483647;
+    for (let i = 0; i < 900; i++) stars.push({ x: rnd() * 8000 - 4000, y: rnd() * 8000 - 4000, z: i < 450 ? 0.2 : i < 750 ? 0.45 : 0.7, b: 0.25 + rnd() * 0.75 }); }
+
+  // ---- procedural carrier hull, built once per side ----
+  function buildCarrier(side) {
+    const L = 560, Wd = 230;                     // art canvas size
+    const c = document.createElement('canvas'); c.width = L; c.height = Wd;
+    const x = c.getContext('2d');
+    x.translate(L / 2, Wd / 2);
+    const U = 1.1;                                // px per metre-ish
+    const main = side === 'P' ? ['#5d7a99', '#31435a', '#182230'] : ['#8c3a42', '#4a1e26', '#1c0c10'];
+    const trim = side === 'P' ? '#8fb2d4' : '#c25a55';
+    const HULL = [[230, 0], [180, 28], [95, 46], [-30, 58], [-140, 62], [-205, 44], [-228, 16],
+                  [-228, -16], [-205, -44], [-140, -62], [-30, -58], [95, -46], [180, -28]];
+    const poly = pts => { x.beginPath(); pts.forEach((p, i) => i ? x.lineTo(p[0] * U, p[1] * U) : x.moveTo(p[0] * U, p[1] * U)); x.closePath(); };
+    // shadow, hull, deck
+    x.save(); x.translate(0, 5); poly(HULL); x.fillStyle = 'rgba(0,0,0,0.5)'; x.fill(); x.restore();
+    poly(HULL);
+    const grd = x.createLinearGradient(0, -70, 0, 70);
+    grd.addColorStop(0, main[0]); grd.addColorStop(0.5, main[1]); grd.addColorStop(1, main[2]);
+    x.fillStyle = grd; x.fill();
+    x.strokeStyle = trim; x.lineWidth = 2.5; x.stroke();
+    // panel lines
+    x.strokeStyle = 'rgba(5,10,16,0.55)'; x.lineWidth = 1.4;
+    x.beginPath();
+    for (const px of [190, 140, 90, 30, -30, -90, -150, -195])
+      { x.moveTo(px * U, -52 * U); x.lineTo(px * U, 52 * U); }
+    x.moveTo(-210 * U, 0); x.lineTo(215 * U, 0);
+    x.stroke();
+    // rows of lit windows: the scale-seller
+    x.fillStyle = side === 'P' ? 'rgba(190,225,255,0.85)' : 'rgba(255,190,150,0.8)';
+    for (let wx = -180; wx < 200; wx += 9)
+      for (const wy of [-30, -12, 14, 30])
+        if (Math.random() < 0.62) x.fillRect(wx * U, wy * U, 3, 1.6);
+    // hangar mouth (glowing slot on the flank)
+    x.fillStyle = '#05070c';
+    x.fillRect(-70 * U, 46 * U, 62 * U, 14 * U);
+    x.fillStyle = side === 'P' ? 'rgba(120,210,255,0.75)' : 'rgba(255,140,90,0.7)';
+    x.fillRect(-68 * U, 48 * U, 58 * U, 10 * U);
+    // engine block
+    x.fillStyle = '#0a0d13'; x.fillRect(-232 * U, -30 * U, 16 * U, 60 * U);
+    x.fillStyle = side === 'P' ? 'rgba(140,215,255,0.9)' : 'rgba(255,150,90,0.9)';
+    for (const ey of [-20, 0, 20]) { x.beginPath(); x.ellipse(-230 * U, ey * U, 5, 8, 0, 0, TAU); x.fill(); }
+    // subsystem housings
+    const box = (sx, sy, w2, h2, col) => { x.fillStyle = col; x.fillRect((sx - w2 / 2) * U, (sy - h2 / 2) * U, w2 * U, h2 * U); x.strokeStyle = 'rgba(0,0,0,0.5)'; x.strokeRect((sx - w2 / 2) * U, (sy - h2 / 2) * U, w2 * U, h2 * U); };
+    box(55, -58, 46, 26, main[0]);              // shield gen
+    x.fillStyle = trim; x.beginPath(); x.arc(55 * U, -58 * U, 9, 0, TAU); x.fill();
+    box(130, 34, 52, 24, main[0]);              // weapons array
+    x.fillStyle = '#ffd070'; x.fillRect(112 * U, 30 * U, 40, 3);
+    // spinal ridge
+    x.fillStyle = trim; x.fillRect(60 * U, -2.5, 170 * U - 60 * U, 5);
+    // conning tower
+    x.fillStyle = main[0]; x.fillRect(-10 * U, -14 * U, 40 * U, 28 * U);
+    x.fillStyle = trim; x.fillRect(2 * U, -6 * U, 16 * U, 12 * U);
+    return c;
+  }
+  const HULLS = { P: buildCarrier('P'), E: buildCarrier('E') };
+
+  // transient FX
+  let parts = [], rings = [], flashes = [], beams = [], shake = 0, redF = 0, lastT = performance.now() / 1000;
+  function boom(x, y, r, big) {
+    const n = big ? 70 : 16 + r;
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * TAU, sp = 30 + Math.random() * (big ? 300 : 160);
+      parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0.4 + Math.random() * (big ? 1.3 : 0.7), max: 1.4, k: 'fire', sz: 2 + Math.random() * (big ? 6 : 3) });
+    }
+    for (let i = 0; i < (big ? 18 : 5); i++) {
+      const a = Math.random() * TAU, sp = 15 + Math.random() * 60;
+      parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1 + Math.random() * 1.4, max: 2.2, k: 'smoke', sz: 5 + Math.random() * 7 });
+    }
+    rings.push({ x, y, r: 4, max: big ? 200 : 34 + r * 2, life: big ? 0.8 : 0.4, t: 0 });
+    flashes.push({ x, y, r: big ? 170 : 30 + r * 2, life: 0.12, max: 0.12, img: GLOW.white });
+    shake = Math.min(26, shake + (big ? 18 : r * 0.35));
+  }
+  function handle(evts, S) {
+    for (const e of evts) {
+      switch (e.type) {
+        case 'boom': boom(e.x, e.y, e.r, e.big); break;
+        case 'armorhit':
+          for (let i = 0; i < 5; i++) { const a = Math.random() * TAU, sp = 30 + Math.random() * 110; parts.push({ x: e.x, y: e.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0.3, max: 0.3, k: 'spark', sz: 1.8 }); }
+          if (e.big) shake = Math.min(26, shake + 7);
+          break;
+        case 'shield': rings.push({ x: e.c.x, y: e.c.y, r: e.c.radius * 1.15, max: e.c.radius * 1.3, life: 0.3, t: 0, shield: true, ang: e.ang }); break;
+        case 'pd': beams.push({ x1: e.x, y1: e.y, x2: e.tx, y2: e.ty, life: 0.07, col: 'rgba(255,220,150,0.8)' }); break;
+        case 'pew': flashes.push({ x: e.x, y: e.y, r: 9, life: 0.05, max: 0.05, img: e.side === 'P' ? GLOW.blue : GLOW.red }); break;
+        case 'broadside': flashes.push({ x: e.x, y: e.y, r: 42, life: 0.14, max: 0.14, img: GLOW.gold }); shake = Math.min(26, shake + 3); break;
+        case 'spinal': flashes.push({ x: e.x, y: e.y, r: 120, life: 0.3, max: 0.3, img: GLOW.teal }); shake = Math.min(26, shake + 10); break;
+        case 'subdown': boom(e.x || 0, e.y || 0, 20, false); if (e.side === 'P') redF = 0.5; break;
+        case 'carrierdeath': boom(e.c.x, e.c.y, 60, true); boom(e.c.x + 80, e.c.y + 40, 40, true); boom(e.c.x - 90, e.c.y - 30, 40, true); break;
+        case 'fighterdown': if (e.side === 'P') redF = Math.min(0.5, redF + 0.18); break;
+      }
+    }
+  }
+
+  const w2x = x => (x - cam.x) * scale + W / 2;
+  const w2y = y => (y - cam.y) * scale + H / 2;
+
+  function drawCarrier(S, c, now) {
+    const x = w2x(c.x), y = w2y(c.y);
+    const img = HULLS[c.side];
+    const dw = 470 * scale, dh = dw * img.height / img.width;
+    // engine wake
+    g.globalCompositeOperation = 'lighter';
+    const spd = Math.hypot(c.vx, c.vy);
+    if (spd > 4 && !c.subs.engines.disabled) {
+      const ex = x - Math.cos(c.face) * dw * 0.5, ey = y - Math.sin(c.face) * dw * 0.5;
+      glow(ex, ey, 60 * scale + 20, c.side === 'P' ? GLOW.blue : GLOW.orange, 0.5);
+    }
+    glow(x, y, dw * 0.7, c.side === 'P' ? GLOW.blue : GLOW.red, 0.07);
+    // shield bubble
+    if (c.shield > 0) {
+      g.strokeStyle = c.side === 'P' ? `rgba(120,200,255,${0.1 + 0.25 * c.shield / c.shieldMax})` : `rgba(255,120,120,${0.1 + 0.25 * c.shield / c.shieldMax})`;
+      g.lineWidth = 1.5;
+      g.beginPath(); g.ellipse(x, y, c.radius * 1.55 * scale, c.radius * 1.05 * scale, c.face, 0, TAU); g.stroke();
+    }
+    g.globalCompositeOperation = 'source-over';
+    g.save(); g.translate(x, y); g.rotate(c.face);
+    g.drawImage(img, -dw / 2, -dh / 2, dw, dh);
+    g.restore();
+    // subsystem state: fires on wounded modules, dark on dead ones
+    for (const k of Sim.SUBKEYS) {
+      const sub = c.subs[k], p = Sim.subWorld(c, k);
+      const sx = w2x(p.x), sy = w2y(p.y);
+      if (sub.disabled) {
+        g.fillStyle = 'rgba(8,8,10,0.75)';
+        g.beginPath(); g.arc(sx, sy, Sim.SUBS[k].r * scale, 0, TAU); g.fill();
+        if (Math.random() < 0.3) parts.push({ x: p.x, y: p.y, vx: (Math.random() - 0.5) * 30, vy: (Math.random() - 0.5) * 30, life: 1, max: 1, k: 'smoke', sz: 5 });
+      } else if (sub.hp < sub.max * 0.5) {
+        g.globalCompositeOperation = 'lighter';
+        glow(sx, sy, Sim.SUBS[k].r * scale * (0.8 + 0.2 * Math.sin(now * 13)), GLOW.orange, 0.5 * (1 - sub.hp / sub.max));
+        g.globalCompositeOperation = 'source-over';
+        if (Math.random() < 0.12) parts.push({ x: p.x, y: p.y, vx: (Math.random() - 0.5) * 25, vy: (Math.random() - 0.5) * 25, life: 0.8, max: 0.8, k: 'smoke', sz: 4 });
+      }
+    }
+  }
+
+  function drawFighter(f) {
+    const x = w2x(f.x), y = w2y(f.y);
+    const s = Math.max(4.5, 11 * scale * 3);
+    g.globalCompositeOperation = 'lighter';
+    // trail
+    g.strokeStyle = f.side === 'P' ? 'rgba(110,190,255,0.35)' : 'rgba(255,110,80,0.35)';
+    g.lineWidth = Math.max(1, 2 * scale * 2);
+    g.beginPath(); g.moveTo(x, y);
+    g.lineTo(x - f.vx * 0.06 * scale, y - f.vy * 0.06 * scale); g.stroke();
+    glow(x, y, s * 1.5, f.side === 'P' ? GLOW.blue : GLOW.red, 0.3);
+    g.globalCompositeOperation = 'source-over';
+    g.save(); g.translate(x, y); g.rotate(f.face);
+    g.fillStyle = f.side === 'P'
+      ? (f.role === 'BMB' ? '#7fa8cc' : f.role === 'DEF' ? '#9fc8e8' : '#c8e2f8')
+      : (f.role === 'BMB' ? '#b85a50' : '#e07a66');
+    g.beginPath();
+    g.moveTo(s, 0); g.lineTo(-s * 0.7, s * 0.55); g.lineTo(-s * 0.35, 0); g.lineTo(-s * 0.7, -s * 0.55);
+    g.closePath(); g.fill();
+    g.restore();
+    // hp sliver
+    if (f.hp < f.max) {
+      g.fillStyle = 'rgba(20,26,34,0.8)'; g.fillRect(x - 9, y - s - 6, 18, 3);
+      g.fillStyle = f.hp / f.max > 0.5 ? '#7fe0a0' : f.hp / f.max > 0.25 ? '#ffd070' : '#ff6a5a';
+      g.fillRect(x - 9, y - s - 6, 18 * f.hp / f.max, 3);
+    }
+  }
+
+  /* ---- HUD helpers ---- */
+  function bar(x, y, w, h, frac, col, back) {
+    sctx.fillStyle = back || 'rgba(18,24,32,0.85)'; sctx.fillRect(x, y, w, h);
+    sctx.fillStyle = col; sctx.fillRect(x, y, w * clamp(frac, 0, 1), h);
+  }
+  const rects = { subs: [], squads: [] };
+
+  function drawHUD(S, now) {
+    sctx.textBaseline = 'alphabetic';
+    const P = S.P, E = S.E;
+    // ===== my ship (bottom-left) =====
+    const bx = 14, by = H - 168, bw = 250;
+    sctx.fillStyle = 'rgba(6,10,16,0.78)'; sctx.fillRect(bx, by, bw, 156);
+    sctx.strokeStyle = 'rgba(110,160,210,0.4)'; sctx.strokeRect(bx + 0.5, by + 0.5, bw, 156);
+    sctx.fillStyle = '#9fc0dd'; sctx.font = 'bold 11px Consolas,monospace'; sctx.textAlign = 'left';
+    sctx.fillText('LEVIATHAN  —  your command', bx + 8, by + 15);
+    bar(bx + 8, by + 22, bw - 16, 9, P.shield / P.shieldMax, 'rgba(95,170,255,0.9)');
+    bar(bx + 8, by + 33, bw - 16, 9, P.hull / P.hullMax, P.hull / P.hullMax > 0.35 ? 'rgba(140,220,170,0.9)' : 'rgba(255,110,90,0.95)');
+    sctx.fillStyle = '#7d93a8'; sctx.font = '9px Consolas,monospace';
+    sctx.fillText('SHD ' + Math.round(P.shield) + '   HULL ' + Math.round(P.hull), bx + 8, by + 52);
+    // subsystems
+    Sim.SUBKEYS.forEach((k, i) => {
+      const sub = P.subs[k], yy = by + 60 + i * 13;
+      sctx.fillStyle = sub.disabled ? '#ff6a5a' : '#9fb4c8'; sctx.font = '9px Consolas,monospace';
+      sctx.fillText(Sim.SUBS[k].label + (sub.disabled ? ' OFFLINE' : ''), bx + 8, yy + 8);
+      bar(bx + 118, yy, bw - 126, 8, sub.hp / sub.max, sub.disabled ? 'rgba(255,90,70,0.8)' : 'rgba(190,210,120,0.85)');
+    });
+    // power pips
+    sctx.fillStyle = '#9fc0dd'; sctx.font = 'bold 9px Consolas,monospace';
+    sctx.fillText('POWER  [Z]wpn [X]bal [C]shd [V]hgr', bx + 8, by + 122);
+    ['shields', 'weapons', 'engines', 'hangar'].forEach((k, i) => {
+      sctx.fillStyle = '#7d93a8'; sctx.font = '8px Consolas,monospace';
+      sctx.fillText(k.slice(0, 3).toUpperCase(), bx + 8 + i * 60, by + 136);
+      for (let p2 = 0; p2 < 4; p2++) {
+        sctx.fillStyle = p2 < P.power[k] ? '#ffd070' : 'rgba(60,66,74,0.8)';
+        sctx.fillRect(bx + 8 + i * 60 + 24 + p2 * 7, by + 129, 5, 8);
+      }
+    });
+    // weapons readout
+    const canB = Sim.canBroadside(P) && !P.subs.weapons.disabled;
+    sctx.font = 'bold 9px Consolas,monospace';
+    sctx.fillStyle = P.broadCd <= 0 && canB ? '#8fe0a8' : '#7d93a8';
+    sctx.fillText('[LMB] BROADSIDE ' + (P.subs.weapons.disabled ? 'OFFLINE' : canB ? (P.broadCd <= 0 ? 'READY' : P.broadCd.toFixed(1)) : 'NO ARC — show your flank'), bx + 8, by + 152);
+    // ===== spinal + target (bottom-center) =====
+    sctx.textAlign = 'center';
+    sctx.fillStyle = P.spinalCd <= 0 ? '#7fe0d8' : '#7d93a8';
+    sctx.fillText('[SPACE] SPINAL TORPEDOES ' + (P.spinalCd <= 0 ? 'READY' : Math.ceil(P.spinalCd) + 's') + '  →  ' + Sim.SUBS[P.targetSub].label + '  ([TAB] retarget)', W / 2, H - 10);
+
+    // ===== enemy ship (bottom-right) =====
+    const ex = W - 264, ey = H - 128, ew = 250;
+    sctx.textAlign = 'left';
+    sctx.fillStyle = 'rgba(16,8,10,0.78)'; sctx.fillRect(ex, ey, ew, 116);
+    sctx.strokeStyle = 'rgba(220,110,100,0.45)'; sctx.strokeRect(ex + 0.5, ey + 0.5, ew, 116);
+    sctx.fillStyle = '#e0a0a0'; sctx.font = 'bold 11px Consolas,monospace';
+    sctx.fillText('HOSTILE CARRIER — ' + S.diff.name, ex + 8, ey + 15);
+    bar(ex + 8, ey + 22, ew - 16, 8, E.shield / E.shieldMax, 'rgba(255,130,130,0.85)');
+    bar(ex + 8, ey + 32, ew - 16, 8, E.hull / E.hullMax, 'rgba(255,90,70,0.9)');
+    rects.subs.length = 0;
+    Sim.SUBKEYS.forEach((k, i) => {
+      const sub = E.subs[k], yy = ey + 48 + i * 16;
+      const sel = P.targetSub === k;
+      if (sel) { sctx.fillStyle = 'rgba(120,220,210,0.16)'; sctx.fillRect(ex + 4, yy - 3, ew - 8, 15); }
+      sctx.fillStyle = sub.disabled ? '#ff6a5a' : sel ? '#7fe0d8' : '#d8a0a0';
+      sctx.font = '9px Consolas,monospace';
+      sctx.fillText((sel ? '► ' : '  ') + Sim.SUBS[k].label + (sub.disabled ? ' OFFLINE' : ''), ex + 8, yy + 8);
+      bar(ex + 122, yy, ew - 130, 8, sub.hp / sub.max, 'rgba(255,140,110,0.85)');
+      rects.subs.push({ x: ex + 4, y: yy - 3, w: ew - 8, h: 15, key: k });
+    });
+
+    // ===== squadron roster (top-left) =====
+    rects.squads.length = 0;
+    const sy0 = 12;
+    sctx.fillStyle = 'rgba(6,10,16,0.78)'; sctx.fillRect(14, sy0, 252, 118);
+    sctx.strokeStyle = 'rgba(110,160,210,0.4)'; sctx.strokeRect(14.5, sy0 + 0.5, 252, 118);
+    sctx.fillStyle = '#9fc0dd'; sctx.font = 'bold 10px Consolas,monospace';
+    sctx.fillText('WINGS  [1-3] select · [4] all · [L]aunch', 22, sy0 + 14);
+    for (let sq = 0; sq < 3; sq++) {
+      const yy = sy0 + 24 + sq * 24;
+      const seld = S.sel === sq || S.sel === 3;
+      if (seld) { sctx.fillStyle = 'rgba(120,180,240,0.14)'; sctx.fillRect(18, yy - 2, 244, 22); }
+      sctx.fillStyle = seld ? '#cfe4f8' : '#8fa4b8'; sctx.font = 'bold 9px Consolas,monospace';
+      sctx.fillText((sq + 1) + ' ' + Sim.ROLES[Sim.SQUADS[sq]].label.slice(0, 6), 22, yy + 9);
+      rects.squads.push({ x: 18, y: yy - 2, w: 244, h: 22, sq });
+      const members = S.fighters.filter(f => f.side === 'P' && f.squad === sq);
+      members.forEach((f, i) => {
+        const fx = 96 + i * 42;
+        if (!f.alive) { sctx.fillStyle = '#5a3a3a'; sctx.fillText('✝', fx, yy + 9); return; }
+        bar(fx, yy + 1, 34, 6, f.hp / f.max, f.hp / f.max > 0.5 ? '#7fe0a0' : f.hp / f.max > 0.25 ? '#ffd070' : '#ff6a5a');
+        sctx.fillStyle = f.repairing ? '#7fe0d8' : '#7d93a8'; sctx.font = '8px Consolas,monospace';
+        sctx.fillText(f.state === 'docked' ? (f.repairing ? 'REP ' + Math.round(100 * f.hp / f.max) + '%' : 'BAY') :
+          f.state === 'recall' ? 'RTB' : f.state.slice(0, 3).toUpperCase(), fx, yy + 16);
+      });
+    }
+    sctx.fillStyle = 'rgba(140,165,190,0.8)'; sctx.font = '9px Consolas,monospace';
+    sctx.fillText('[Q]ntercept  [E]strike  [F]defend  [G]roup  [R]ECALL', 22, sy0 + 111);
+
+    // ===== minimap (top-right) =====
+    const mR = 74, mx = W - mR - 18, my = mR + 18;
+    sctx.fillStyle = 'rgba(6,10,16,0.75)';
+    sctx.beginPath(); sctx.arc(mx, my, mR, 0, TAU); sctx.fill();
+    sctx.strokeStyle = 'rgba(110,160,210,0.4)'; sctx.stroke();
+    const mput = (wx, wy) => {
+      const s2 = mR / 2400;
+      let dx = (wx - (P.x + E.x) / 2) * s2, dy = (wy - (P.y + E.y) / 2) * s2;
+      const d = Math.hypot(dx, dy); if (d > mR - 5) { dx *= (mR - 5) / d; dy *= (mR - 5) / d; }
+      return [mx + dx, my + dy];
+    };
+    for (const f of S.fighters) {
+      if (!f.alive || f.state === 'docked') continue;
+      const [fx2, fy2] = mput(f.x, f.y);
+      sctx.fillStyle = f.side === 'P' ? '#7fb8ff' : '#ff8a70';
+      sctx.fillRect(fx2 - 1, fy2 - 1, 2, 2);
+    }
+    for (const c of [P, E]) {
+      const [cx2, cy2] = mput(c.x, c.y);
+      sctx.save(); sctx.translate(cx2, cy2); sctx.rotate(c.face);
+      sctx.fillStyle = c.side === 'P' ? '#bfe0ff' : '#ff6a5a';
+      sctx.fillRect(-6, -2.5, 12, 5);
+      sctx.restore();
+    }
+
+    // alerts
+    sctx.textAlign = 'center';
+    let ay = 90;
+    const warn = (t, col) => { if (Math.floor(now * 4) % 2 === 0) { sctx.fillStyle = col; sctx.font = 'bold 14px Consolas,monospace'; sctx.fillText(t, W / 2, ay); } ay += 20; };
+    if (P.subs.hangar.disabled) warn('⚠ HANGAR OFFLINE — no launch · no repair', '#ff6a5a');
+    if (P.subs.shieldgen.disabled) warn('SHIELD GENERATOR OFFLINE', '#ffb35a');
+    if (P.subs.engines.disabled) warn('ENGINES OFFLINE', '#ffb35a');
+    if (P.subs.weapons.disabled) warn('WEAPONS ARRAY OFFLINE', '#ffb35a');
+    if (P.shield <= 0) warn('SHIELDS DOWN', '#ffd070');
+
+    // tutorial beats
+    if (S.tut < 3 && S.t < 150) {
+      const msgs = [
+        'Press [L] to LAUNCH your selected wing from the hangar',
+        'Select a wing [1-3] and order a STRIKE with [E] — bombers gut subsystems',
+        'Watch their health bars — press [R] to RECALL them home before they die'
+      ];
+      sctx.fillStyle = 'rgba(7,12,20,0.85)';
+      const tw = 560; sctx.fillRect(W / 2 - tw / 2, 128, tw, 30);
+      sctx.strokeStyle = 'rgba(120,180,255,0.5)'; sctx.strokeRect(W / 2 - tw / 2 + 0.5, 128.5, tw, 30);
+      sctx.fillStyle = '#d7e3ef'; sctx.font = '12px Consolas,monospace';
+      sctx.fillText(msgs[S.tut], W / 2, 147);
+    }
+  }
+
+  function overlay(S) {
+    sctx.textAlign = 'center';
+    if (S.mode === 'title') {
+      sctx.fillStyle = 'rgba(2,4,9,0.6)'; sctx.fillRect(0, 0, W, H);
+      sctx.save();
+      sctx.shadowColor = 'rgba(120,190,255,0.9)'; sctx.shadowBlur = 30;
+      sctx.fillStyle = '#eaf2fa'; sctx.font = '900 60px Impact,"Arial Black",sans-serif';
+      sctx.fillText('L E V I A T H A N S', W / 2, H * 0.24);
+      sctx.restore();
+      sctx.fillStyle = '#8fa4b8'; sctx.font = '14px Consolas,monospace';
+      sctx.fillText('two carriers · a hundred sparks between them · bring your wings home', W / 2, H * 0.24 + 30);
+      const lines = [
+        ['HELM', 'W/S thrust · A/D turn — 60,000 tonnes of momentum'],
+        ['CAPITAL GUNS', 'LMB broadside (show your FLANK) · SPACE spinal torpedoes at [TAB] subsystem'],
+        ['WINGS', '1-3 select · 4 all · L launch · Q intercept · E strike · F defend · G regroup'],
+        ['THE SOUL', 'R = RECALL. Wounded fighters that dock are REPAIRED and fly again. Dead ones are gone.'],
+        ['POWER', 'Z weapons · X balanced · C shields · V hangar — the budget is the battle'],
+        ['', 'protect your HANGAR. kill theirs.']
+      ];
+      let yy = H * 0.4;
+      for (const [h2, t2] of lines) {
+        sctx.fillStyle = '#7fb8d8'; sctx.font = 'bold 12px Consolas,monospace';
+        sctx.fillText(h2, W / 2 - 290, yy);
+        sctx.fillStyle = '#c3d2e0'; sctx.font = '12px Consolas,monospace';
+        sctx.textAlign = 'left';
+        sctx.fillText(t2, W / 2 - 210, yy);
+        sctx.textAlign = 'center';
+        yy += 26;
+      }
+      sctx.save();
+      sctx.shadowColor = 'rgba(255,200,90,0.9)'; sctx.shadowBlur = 12;
+      sctx.fillStyle = '#ffe9b0'; sctx.font = 'bold 17px Consolas,monospace';
+      sctx.fillText('press  [1] ENSIGN   [2] CAPTAIN   [3] ADMIRAL   to engage', W / 2, yy + 26);
+      sctx.restore();
+    } else if (S.mode === 'end') {
+      const won = S.winner === 'P';
+      sctx.fillStyle = won ? 'rgba(3,14,8,0.55)' : 'rgba(20,4,4,0.55)'; sctx.fillRect(0, 0, W, H);
+      sctx.save();
+      sctx.shadowColor = won ? 'rgba(120,255,180,0.8)' : 'rgba(255,80,60,0.8)'; sctx.shadowBlur = 26;
+      sctx.fillStyle = won ? '#e2f5e4' : '#f5e0dc'; sctx.font = 'bold 44px Consolas,monospace';
+      sctx.fillText(won ? 'ENEMY CARRIER DESTROYED' : 'LEVIATHAN LOST', W / 2, H * 0.36);
+      sctx.restore();
+      const st = S.stats, mm = Math.floor(S.endT / 60), ss = Math.floor(S.endT % 60);
+      sctx.fillStyle = '#c3d2e0'; sctx.font = '14px Consolas,monospace';
+      sctx.fillText('battle time ' + mm + ':' + (ss < 10 ? '0' : '') + ss
+        + ' · sorties ' + st.sorties + ' · fighters saved ' + st.saved + ' · lost ' + st.lost, W / 2, H * 0.36 + 34);
+      sctx.fillText('damage dealt ' + Math.round(st.dealt) + ' · taken ' + Math.round(st.taken), W / 2, H * 0.36 + 56);
+      sctx.fillStyle = won && st.lost === 0 ? '#ffd978' : '#8fa4b8';
+      if (won && st.lost === 0) sctx.fillText('★ NOT ONE PILOT LEFT BEHIND ★', W / 2, H * 0.36 + 84);
+      sctx.fillStyle = '#eaf2fa'; sctx.font = 'bold 15px Consolas,monospace';
+      sctx.fillText('press ENTER to fight again', W / 2, H * 0.36 + 116);
+    } else if (S.paused) {
+      sctx.fillStyle = 'rgba(2,4,9,0.55)'; sctx.fillRect(0, 0, W, H);
+      sctx.fillStyle = '#eaf2fa'; sctx.font = 'bold 30px Consolas,monospace';
+      sctx.fillText('PAUSED — [P] resume', W / 2, H * 0.4);
+    }
+  }
+
+  function render(S, evts) {
+    const now = performance.now() / 1000;
+    const dt = clamp(now - lastT, 0.001, 0.05); lastT = now;
+    handle(evts, S);
+    const P = S.P, E = S.E;
+    // camera frames both titans
+    const d = dist(P.x, P.y, E.x, E.y);
+    scale += (clamp(Math.min(W, H) / (d + 950), 0.16, 0.5) - scale) * (1 - Math.exp(-2 * dt));
+    cam.x += ((P.x * 0.58 + E.x * 0.42) - cam.x) * (1 - Math.exp(-2.5 * dt));
+    cam.y += ((P.y * 0.58 + E.y * 0.42) - cam.y) * (1 - Math.exp(-2.5 * dt));
+    if (shake > 0.3) { cam.x += (Math.random() - 0.5) * shake / scale * 0.3; cam.y += (Math.random() - 0.5) * shake / scale * 0.3; shake *= Math.exp(-5 * dt); }
+
+    // ---- world buffer ----
+    g.setTransform(DPR, 0, 0, DPR, 0, 0);
+    const bg = g.createRadialGradient(W / 2, H / 2, H * 0.15, W / 2, H / 2, H * 1.1);
+    bg.addColorStop(0, '#0a1120'); bg.addColorStop(0.6, '#050810'); bg.addColorStop(1, '#02040a');
+    g.fillStyle = bg; g.fillRect(0, 0, W, H);
+    g.globalCompositeOperation = 'lighter';
+    glow((-2600 - cam.x * 0.05) * scale + W / 2, (-1400 - cam.y * 0.05) * scale + H / 2, 300 * scale + 130, GLOW.gold, 0.5);
+    glow((1800 - cam.x * 0.07) * scale + W / 2, (1600 - cam.y * 0.07) * scale + H / 2, 900 * scale, GLOW.teal, 0.06);
+    glow((-1500 - cam.x * 0.07) * scale + W / 2, (900 - cam.y * 0.07) * scale + H / 2, 1100 * scale, GLOW.red, 0.05);
+    g.globalCompositeOperation = 'source-over';
+    for (const st of stars) {
+      const px = ((st.x - cam.x * st.z) % 8000 + 12000) % 8000 - 4000;
+      const py = ((st.y - cam.y * st.z) % 8000 + 12000) % 8000 - 4000;
+      const sx = px * scale + W / 2, sy = py * scale + H / 2;
+      if (sx < 0 || sx > W || sy < 0 || sy > H) continue;
+      g.fillStyle = `rgba(195,210,230,${(st.b * 0.85).toFixed(2)})`;
+      g.fillRect(sx, sy, st.z > 0.5 ? 1.6 : 1, st.z > 0.5 ? 1.6 : 1);
+    }
+
+    drawCarrier(S, P, now); drawCarrier(S, E, now);
+
+    // projectiles
+    g.globalCompositeOperation = 'lighter';
+    for (const pr of S.projectiles) {
+      const x = w2x(pr.x), y = w2y(pr.y);
+      if (pr.kind === 'storp') {
+        glow(x, y, 16, pr.side === 'P' ? GLOW.teal : GLOW.orange, 0.9);
+        g.fillStyle = '#fff'; g.beginPath(); g.arc(x, y, 2.5, 0, TAU); g.fill();
+        if (Math.random() < 0.5) parts.push({ x: pr.x, y: pr.y, vx: 0, vy: 0, life: 0.4, max: 0.4, k: 'smoke', sz: 3 });
+      } else {
+        const L2 = pr.kind === 'shell' ? 0.03 : 0.014;
+        g.strokeStyle = pr.side === 'P'
+          ? (pr.kind === 'shell' ? 'rgba(255,220,140,0.95)' : 'rgba(140,210,255,0.9)')
+          : (pr.kind === 'shell' ? 'rgba(255,160,90,0.95)' : 'rgba(255,110,90,0.9)');
+        g.lineWidth = pr.kind === 'shell' ? 3 : 1.6;
+        g.beginPath(); g.moveTo(x, y); g.lineTo(x - pr.vx * L2 * scale, y - pr.vy * L2 * scale); g.stroke();
+      }
+    }
+    // pd beams
+    beams = beams.filter(b => (b.life -= dt) > 0);
+    for (const b of beams) {
+      g.strokeStyle = b.col; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(w2x(b.x1), w2y(b.y1)); g.lineTo(w2x(b.x2), w2y(b.y2)); g.stroke();
+    }
+    g.globalCompositeOperation = 'source-over';
+
+    for (const f of S.fighters) if (f.alive && f.state !== 'docked') drawFighter(f);
+
+    // particles / rings / flashes
+    g.globalCompositeOperation = 'lighter';
+    parts = parts.filter(p => (p.life -= dt) > 0);
+    for (const p of parts) {
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      const a = clamp(p.life / p.max, 0, 1);
+      const x = w2x(p.x), y = w2y(p.y);
+      if (p.k === 'fire') glow(x, y, p.sz * scale * 6 + 3, a > 0.55 ? GLOW.gold : GLOW.orange, a);
+      else if (p.k === 'spark') glow(x, y, p.sz * scale * 5 + 2, GLOW.orange, a);
+      else { g.globalCompositeOperation = 'source-over'; g.fillStyle = `rgba(40,44,52,${(a * 0.4).toFixed(2)})`; g.beginPath(); g.arc(x, y, p.sz * scale * 3 + 2, 0, TAU); g.fill(); g.globalCompositeOperation = 'lighter'; }
+    }
+    rings = rings.filter(r2 => (r2.t += dt) < r2.life);
+    for (const r2 of rings) {
+      const k = r2.t / r2.life;
+      g.strokeStyle = r2.shield ? `rgba(120,200,255,${(0.6 * (1 - k)).toFixed(2)})` : `rgba(255,190,120,${(0.7 * (1 - k)).toFixed(2)})`;
+      g.lineWidth = 2;
+      g.beginPath();
+      if (r2.shield) g.arc(w2x(r2.x), w2y(r2.y), r2.max * scale, r2.ang - 0.8, r2.ang + 0.8);
+      else g.arc(w2x(r2.x), w2y(r2.y), lerp(r2.r, r2.max, 1 - Math.pow(1 - k, 2)) * scale, 0, TAU);
+      g.stroke();
+    }
+    flashes = flashes.filter(f2 => (f2.life -= dt) > 0);
+    for (const f2 of flashes) glow(w2x(f2.x), w2y(f2.y), f2.r * scale, f2.img, f2.life / f2.max);
+    g.globalCompositeOperation = 'source-over';
+
+    // ---- composite + bloom ----
+    sctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    sctx.drawImage(wcv, 0, 0, W, H);
+    bactx.clearRect(0, 0, bA.width, bA.height);
+    bactx.drawImage(wcv, 0, 0, bA.width, bA.height);
+    bbctx.clearRect(0, 0, bB.width, bB.height);
+    bbctx.drawImage(bA, 0, 0, bB.width, bB.height);
+    sctx.globalCompositeOperation = 'lighter';
+    sctx.globalAlpha = 0.28; sctx.drawImage(bA, 0, 0, W, H);
+    sctx.globalAlpha = 0.32; sctx.drawImage(bB, 0, 0, W, H);
+    sctx.globalAlpha = 1; sctx.globalCompositeOperation = 'source-over';
+    if (redF > 0.01) {
+      const vg = sctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.8);
+      vg.addColorStop(0, 'rgba(180,30,20,0)'); vg.addColorStop(1, `rgba(180,30,20,${(redF * 0.8).toFixed(2)})`);
+      sctx.fillStyle = vg; sctx.fillRect(0, 0, W, H);
+      redF *= Math.exp(-3 * dt);
+    }
+    const vg2 = sctx.createRadialGradient(W / 2, H / 2, H * 0.42, W / 2, H / 2, H * 0.95);
+    vg2.addColorStop(0, 'rgba(0,0,0,0)'); vg2.addColorStop(1, 'rgba(0,0,10,0.42)');
+    sctx.fillStyle = vg2; sctx.fillRect(0, 0, W, H);
+
+    if (S.mode === 'play') drawHUD(S, now);
+    overlay(S);
+  }
+
+  return {
+    render,
+    subHit: (x, y) => { for (const r2 of rects.subs) if (x >= r2.x && x <= r2.x + r2.w && y >= r2.y && y <= r2.y + r2.h) return r2.key; return null; },
+    squadHit: (x, y) => { for (const r2 of rects.squads) if (x >= r2.x && x <= r2.x + r2.w && y >= r2.y && y <= r2.y + r2.h) return r2.sq; return null; }
+  };
+})();
+
+/* =========================== [4] AUDIO =========================== */
+const Audio2 = (() => {
+  let ac = null, master = null, noiseBuf = null, tension = null, drone = null;
+  const satCurve = (() => { const n = 256, c = new Float32Array(n); for (let i = 0; i < n; i++) { const x = i / (n - 1) * 2 - 1; c[i] = Math.tanh(2.5 * x); } return c; })();
+  function ensure() {
+    if (!ac) {
+      try {
+        ac = new (window.AudioContext || window.webkitAudioContext)();
+        const comp = ac.createDynamicsCompressor();
+        comp.threshold.value = -18; comp.ratio.value = 5; comp.attack.value = 0.003; comp.release.value = 0.2;
+        comp.connect(ac.destination);
+        master = ac.createGain(); master.gain.value = 0.5; master.connect(comp);
+        noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+        const d = noiseBuf.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+        const o1 = ac.createOscillator(), o2 = ac.createOscillator();
+        drone = ac.createGain(); drone.gain.value = 0.018;
+        o1.frequency.value = 48; o2.frequency.value = 48.6; o1.type = o2.type = 'sine';
+        o1.connect(drone); o2.connect(drone); drone.connect(master); o1.start(); o2.start();
+        const t1 = ac.createOscillator(), t2 = ac.createOscillator();
+        tension = ac.createGain(); tension.gain.value = 0;
+        t1.frequency.value = 110; t2.frequency.value = 116.5; t1.type = t2.type = 'sawtooth';
+        const tf = ac.createBiquadFilter(); tf.type = 'lowpass'; tf.frequency.value = 420;
+        t1.connect(tf); t2.connect(tf); tf.connect(tension); tension.connect(master);
+        t1.start(); t2.start();
+      } catch (e) {}
+    }
+    if (ac && ac.state === 'suspended') ac.resume();
+  }
+  function out(pan) {
+    if (!pan || !ac.createStereoPanner) return master;
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); p.connect(master); return p;
+  }
+  function blip(f, dur, type, vol, slide, pan) {
+    if (!ac) return;
+    const o = ac.createOscillator(), gn = ac.createGain();
+    o.type = type; o.frequency.value = f;
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, slide), ac.currentTime + dur);
+    gn.gain.setValueAtTime(vol, ac.currentTime);
+    gn.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+    o.connect(gn); gn.connect(out(pan)); o.start(); o.stop(ac.currentTime + dur);
+  }
+  function noise(dur, vol, f, slide, pan) {
+    if (!ac) return;
+    const src = ac.createBufferSource(); src.buffer = noiseBuf;
+    const fl = ac.createBiquadFilter(); fl.type = 'lowpass';
+    fl.frequency.setValueAtTime(f, ac.currentTime);
+    if (slide) fl.frequency.exponentialRampToValueAtTime(Math.max(30, slide), ac.currentTime + dur);
+    const gn = ac.createGain();
+    gn.gain.setValueAtTime(vol, ac.currentTime);
+    gn.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+    src.connect(fl); fl.connect(gn); gn.connect(out(pan)); src.start(); src.stop(ac.currentTime + dur);
+  }
+  function cannon(pan) {   // the proven mk3 recipe: dive whine through soft-clip + sub
+    if (!ac) return;
+    const t0 = ac.currentTime, dest = out(pan);
+    const clip = ac.createWaveShaper(); clip.curve = satCurve;
+    const cg = ac.createGain(); cg.gain.value = 0.8; clip.connect(cg); cg.connect(dest);
+    const zap = (type, f0, f1, dur, vol) => {
+      const o = ac.createOscillator(), gn = ac.createGain();
+      o.type = type; o.frequency.setValueAtTime(f0, t0);
+      o.frequency.exponentialRampToValueAtTime(f1, t0 + dur);
+      gn.gain.setValueAtTime(vol, t0);
+      gn.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(gn); gn.connect(clip); o.start(t0); o.stop(t0 + dur + 0.02);
+    };
+    zap('sawtooth', 900, 70, 0.3, 0.16); zap('square', 420, 55, 0.22, 0.07);
+    blip(110, 0.25, 'sine', 0.26, 34, pan);
+    noise(0.08, 0.14, 4500, 800, pan);
+  }
+  function handle(evts, S) {
+    if (!ac) return;
+    const px = S.P.x;
+    for (const e of evts) {
+      const pan = e.x != null ? clamp((e.x - px) / 1400, -0.85, 0.85) : 0;
+      switch (e.type) {
+        case 'pew': blip(e.side === 'P' ? 620 : 480, 0.05, 'square', 0.018, 240, pan); break;
+        case 'pd': if (Math.random() < 0.35) blip(1400, 0.03, 'square', 0.014, 700, pan); break;
+        case 'broadside': cannon(pan); break;
+        case 'spinal': blip(90, 0.5, 'sine', 0.3, 26, pan); noise(0.45, 0.2, 500, 60, pan); break;
+        case 'boom': noise(e.big ? 1.6 : 0.5, e.big ? 0.5 : 0.22, 900, 45, pan); if (e.big) blip(60, 1.2, 'sine', 0.3, 24, pan); break;
+        case 'shield': blip(900, 0.08, 'triangle', 0.05, 500, pan); break;
+        case 'armorhit': noise(0.1, 0.06, 900, 200, pan); break;
+        case 'subdown': blip(880, 0.5, 'square', 0.09, 870); blip(660, 0.7, 'square', 0.09, 650); break;   // two-tone alarm
+        case 'subup': blip(520, 0.2, 'sine', 0.06, 780); break;
+        case 'dock': blip(700, 0.12, 'sine', 0.06, 1050, pan); break;
+        case 'ready': blip(880, 0.1, 'sine', 0.06); blip(1320, 0.16, 'sine', 0.06); break;   // ready chime
+        case 'launch': noise(0.5, 0.14, 600, 2600, pan); break;
+        case 'order': blip(740, 0.06, 'sine', 0.05, 950); break;
+        case 'blip': blip(980, 0.04, 'sine', 0.04); break;
+        case 'carrierdeath': noise(2.6, 0.55, 1200, 30, pan); blip(38, 2.6, 'sine', 0.4, 16, pan); break;
+        case 'fighterdown': blip(300, 0.25, 'sawtooth', 0.05, 70, pan); break;
+        case 'battle': blip(340, 0.4, 'sine', 0.07, 500); break;
+      }
+    }
+  }
+  function update(S) {
+    if (!ac || !tension) return;
+    const danger = Math.max(1 - S.P.hull / S.P.hullMax, 1 - S.E.hull / S.E.hullMax);
+    tension.gain.setTargetAtTime(S.mode === 'play' ? danger * 0.05 : 0, ac.currentTime, 0.8);
+  }
+  return { ensure, handle, update };
+})();
+
+/* ======================= [5] INPUT & MAIN ======================= */
+const Input = (() => {
+  const held = new Set();
+  let launch = false, order = null, sel = null, cycleSub = false, preset = null,
+      broadside = false, spinal = false, pause = false, restart = false, start = null,
+      setSub = null;
+  window.addEventListener('keydown', e => {
+    Audio2.ensure();
+    if ([' ', 'Tab'].includes(e.key) || e.key.startsWith('Arrow')) e.preventDefault();
+    if (e.repeat) return;
+    const k = e.key.toLowerCase();
+    held.add(k);
+    if (k === 'l') launch = true;
+    if (k === 'q') order = 'intercept';
+    if (k === 'e') order = 'strike';
+    if (k === 'f') order = 'defend';
+    if (k === 'g') order = 'regroup';
+    if (k === 'r') order = 'recall';
+    if (k >= '1' && k <= '4') {
+      const S = Sim.state();
+      if (S.mode === 'title') start = +k - 1 <= 2 ? +k - 1 : null;
+      else sel = +k - 1;
+    }
+    if (k === 'tab') cycleSub = true;
+    if (k === 'z') preset = 'weapons';
+    if (k === 'x') preset = 'balanced';
+    if (k === 'c') preset = 'shields';
+    if (k === 'v') preset = 'hangar';
+    if (k === ' ') spinal = true;
+    if (k === 'p') pause = true;
+    if (k === 'enter') restart = true;
+  });
+  window.addEventListener('keyup', e => held.delete(e.key.toLowerCase()));
+  window.addEventListener('blur', () => held.clear());
+  const cvEl = document.getElementById('cv');
+  cvEl.addEventListener('pointerdown', e => {
+    Audio2.ensure();
+    const S = Sim.state();
+    if (S.mode === 'title') { start = 1; return; }
+    if (S.mode === 'end') { restart = true; return; }
+    const r = cvEl.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    const sub = Render.subHit(x, y);
+    if (sub) { setSub = sub; return; }
+    const sq = Render.squadHit(x, y);
+    if (sq != null) { sel = sq; return; }
+    broadside = true;
+  });
+  function consume() {
+    const cmd = {
+      thrust: (held.has('w') ? 1 : 0) + (held.has('s') ? -0.6 : 0),
+      turn: (held.has('a') ? -1 : 0) + (held.has('d') ? 1 : 0),
+      launch, order, sel, cycleSub, setSub, preset,
+      broadside: broadside || held.has(' ') && false, spinal, pause, restart, start
+    };
+    launch = false; order = null; sel = null; cycleSub = false; setSub = null;
+    preset = null; broadside = false; spinal = false; pause = false; restart = false; start = null;
+    return cmd;
+  }
+  return { consume };
+})();
+
+(function main() {
+  let last = performance.now() / 1000, acc = 0;
+  function frame() {
+    const now = performance.now() / 1000;
+    acc += Math.min(now - last, 0.25); last = now;
+    const evts = [];
+    while (acc >= TICK) {
+      Sim.tick(Input.consume());
+      evts.push(...Sim.drain());
+      acc -= TICK;
+    }
+    Audio2.handle(evts, Sim.state());
+    Audio2.update(Sim.state());
+    Render.render(Sim.state(), evts);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

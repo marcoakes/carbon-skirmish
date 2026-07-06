@@ -1,5 +1,10 @@
 # STAR BLAZERS — Carbon Skirmish
 
+> **NEW: [LEVIATHANS](https://marcoakes.github.io/carbon-skirmish/leviathans.html)** — a
+> companion game in the same single-file engine style: command a capital carrier,
+> launch and recall fighter wings, manage power and repair bays, and duel an AI
+> admiral doing all the same things back to you. Protect your hangar. Kill theirs.
+
 *An unofficial fan tribute to Star Blazers / Space Battleship Yamato. Not affiliated
 with or endorsed by the rights holders — just love for the ship.*
 
