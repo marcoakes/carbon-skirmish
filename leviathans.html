@@ -14,7 +14,7 @@
 <script>
 "use strict";
 /* =====================================================================
-   LEVIATHANS — a capital-class carrier duel  [build v3.1-simpler-school]
+   LEVIATHANS — a capital-class carrier duel  [build v3.2-armed-school]
    (companion piece to STAR BLAZERS: Carbon Skirmish — same DNA:
     a fixed-tick simulation that owns all state, a renderer that only
     reads it, and WebAudio synthesis for every sound. One file, no deps.)
@@ -124,7 +124,7 @@ const Sim = (() => {
       stage: 1, stage2T: 0,
       score: 0, perfect: false, newBest: false, record: loadRecord(),
       frigates: [],
-      tut: 0, tutT: 0, tutFly: 0, tutSkip: false
+      tut: 0, tutT: 0, tutFly: 0, tutSkip: false, tutBroad: false, tutWMG: false
     };
     S.E.hull = S.E.hullMax = DIFF[di].ehull;
     for (let sq = 0; sq < 3; sq++) {
@@ -469,11 +469,22 @@ const Sim = (() => {
         if (dist(f.x, f.y, tgtF.x, tgtF.y) < role.range && f.gunCd <= 0)
           fireF(f, goalX, goalY, role.dmgF, 'fslug');
       } else {
-        // nothing on the scope: sweep the space between the carriers, hunting
-        const cx2 = (own.x + foe.x) / 2, cy2 = (own.y + foe.y) / 2;
-        const ha = (f.id * 2.399) % TAU;
-        goalX = cx2 + Math.cos(ha + S.t * 0.25) * 380;
-        goalY = cy2 + Math.sin(ha + S.t * 0.25) * 380;
+        // no contacts: ride shotgun on the strike wing — escorts escort
+        let bb = null, bd2 = 1e9;
+        for (const g of S.fighters) {
+          if (!g.alive || g.side !== f.side || g.role !== 'BMB' || g.state === 'docked') continue;
+          const dd = dist(f.x, f.y, g.x, g.y);
+          if (dd < bd2) { bd2 = dd; bb = g; }
+        }
+        if (bb) {
+          const ha = (f.id * 2.399) % TAU;
+          goalX = bb.x + Math.cos(ha) * 120; goalY = bb.y + Math.sin(ha) * 120;
+        } else {
+          // no strike out: sweep the lane between the capitals
+          const k2 = 0.5 + 0.35 * Math.sin(S.t * 0.3 + (f.id % 7));
+          goalX = own.x + (foe.x - own.x) * k2;
+          goalY = own.y + (foe.y - own.y) * k2 + Math.sin(S.t * 0.5 + f.id) * 140;
+        }
       }
     } else if (orderNow === 'defend') {
       // hold a screen around our own carrier; engage what comes close
@@ -605,6 +616,7 @@ const Sim = (() => {
     if (Math.abs(Math.abs(rel) - Math.PI / 2) > 0.95) return false;   // must present the flank
     if (dist(c.x, c.y, foe.x, foe.y) > 1500) return false;
     c.broadCd = 2.6 / pw(c, 'weapons') / (c.side === 'E' ? S.diff.aggro : 1);
+    if (c === S.P) S.tutBroad = true;
     const ca = Math.cos(c.face), sa = Math.sin(c.face);
     // gunnery lead: aim where the target will be when the shells arrive
     const tof = dist(c.x, c.y, foe.x, foe.y) / 620;
@@ -693,7 +705,7 @@ const Sim = (() => {
   }
 
   // ---- the enemy admiral: a mirror who actually thinks ----
-  const tutHold = () => S.diffIdx === 0 && !S.tutSkip && S.tut < 5 && S.t < 75;
+  const tutHold = () => S.diffIdx === 0 && !S.tutSkip && S.tut < 7 && S.t < 110;
   function tickAI() {
     const E = S.E, P = S.P;
     if (E.dead) return;
@@ -705,7 +717,7 @@ const Sim = (() => {
     let want = 820;
     if (hurt < 0.4) want = 1250;
     else if (ahead > 0.15) want = 680 / S.diff.aggro;
-    if (school) want = 1700;
+    if (school) want = 1050;   // close enough for broadside practice; she still holds fire
     const toP = Math.atan2(P.y - E.y, P.x - E.x);
     // face so P sits on our broadside (±90°)
     const flank = wrapA(toP - E.face) > 0 ? 1 : -1;
@@ -803,7 +815,7 @@ const Sim = (() => {
         wm.charge += TICK / 2.2;
         if (wm.charge >= 1) {
           wm.charging = false; wm.charge = 0; wm.cd = 45;
-          S.beamT = 0.7; S.beamN = 0;
+          S.beamT = 0.7; S.beamN = 0; S.tutWMG = true;
           evt({ type: 'wmgfire', x: P.x, y: P.y });
         }
       } else if (wm.charging) { wm.charging = false; wm.charge = 0; }
@@ -869,6 +881,8 @@ const Sim = (() => {
     else if (S.tut === 2 && S.fighters.some(f => f.side === 'P' && f.role === 'BMB' && f.state !== 'docked')) S.tut = 3;
     else if (S.tut === 3 && S.fighters.some(f => f.side === 'P' && f.state === 'recall')) S.tut = 4;
     else if (S.tut === 4 && cmd.preset) S.tut = 5;
+    else if (S.tut === 5 && S.tutBroad) S.tut = 6;
+    else if (S.tut === 6 && S.tutWMG) S.tut = 7;
 
     if (S.winner && S.mode === 'play') {
       S.mode = 'end';
@@ -1498,23 +1512,25 @@ const Render = (() => {
     if (P.shield <= 0) warn('SHIELDS DOWN', '#ffd070');
 
     // flight school (ENSIGN): gated steps while the enemy holds off
-    if (S.diffIdx === 0 && !S.tutSkip && S.tut < 5 && S.t < 75) {
+    if (S.diffIdx === 0 && !S.tutSkip && S.tut < 7 && S.t < 110) {
       const msgs = [
-        'FLIGHT SCHOOL 1/5 — fly the ship: [W] thrust · [A]/[D] turn   (the enemy is holding off)',
-        'FLIGHT SCHOOL 2/5 — press [L] to LAUNCH your selected wing from the hangar',
-        'FLIGHT SCHOOL 3/5 — press [2] then [L]: launch your BOMBERS — they strike the target on their own',
-        'FLIGHT SCHOOL 4/5 — press [R] to RECALL a wing — docked fighters repair and rearm',
-        'FLIGHT SCHOOL 5/5 — set a power preset: [Z] weapons · [X] balanced · [C] shields · [V] hangar'
+        'FLIGHT SCHOOL 1/7 — fly the ship: [W] thrust · [A]/[D] turn   (the enemy is holding off)',
+        'FLIGHT SCHOOL 2/7 — press [L] to LAUNCH your selected wing from the hangar',
+        'FLIGHT SCHOOL 3/7 — press [2] then [L]: launch your BOMBERS — they strike the target on their own',
+        'FLIGHT SCHOOL 4/7 — press [R] to RECALL a wing — docked fighters repair and rearm',
+        'FLIGHT SCHOOL 5/7 — set a power preset: [Z] weapons · [X] balanced · [C] shields · [V] hangar',
+        'FLIGHT SCHOOL 6/7 — show your flank with [A]/[D], then [LMB]: fire a BROADSIDE at the enemy',
+        'FLIGHT SCHOOL 7/7 — hold [H] to 100%: the WAVE MOTION GUN fires down your bow. Aim the ship.'
       ];
       sctx.textAlign = 'center';
       sctx.fillStyle = 'rgba(7,12,20,0.85)';
-      const tw = 620; sctx.fillRect(W / 2 - tw / 2, 128, tw, 44);
+      const tw = 640; sctx.fillRect(W / 2 - tw / 2, 128, tw, 44);
       sctx.strokeStyle = 'rgba(120,180,255,0.5)'; sctx.strokeRect(W / 2 - tw / 2 + 0.5, 128.5, tw, 44);
       sctx.fillStyle = '#d7e3ef'; sctx.font = '12px Consolas,monospace';
       sctx.fillText(msgs[S.tut], W / 2, 146);
       sctx.fillStyle = '#7d93a8'; sctx.font = '10px Consolas,monospace';
       sctx.fillText('[ESC] skip flight school', W / 2, 164);
-    } else if (S.diffIdx === 0 && S.tut === 5 && S.t < 78) {
+    } else if (S.diffIdx === 0 && S.tut === 7 && S.t < 113) {
       sctx.textAlign = 'center';
       sctx.fillStyle = '#8fe0a8'; sctx.font = 'bold 13px Consolas,monospace';
       sctx.fillText('FLIGHT SCHOOL COMPLETE — the enemy is committing. Good hunting, admiral.', W / 2, 147);
