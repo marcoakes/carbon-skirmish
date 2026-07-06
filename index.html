@@ -523,23 +523,25 @@ const Destiny = (() => {
     if (wm.charging) maxSpd *= 0.35;        // braced for firing
     else if (S.beamT > 0) maxSpd *= 0.5;    // holding the beam steady
 
-    let ix = cmd.thrustX, iy = cmd.thrustY;
+    // helm: A/D swing the bow directly, W thrusts along the bow, S brakes.
+    // the touch stick commands a heading; the bow chases it, thrust follows.
+    const ix = cmd.thrustX, iy = cmd.thrustY;
     const il = Math.hypot(ix, iy);
-    if (il > 0) steer(p, ix / il, iy / il, maxSpd, d.inertia);
-    else {
-      const k = 1 - Math.exp(-0.4 * TICK);
-      p.vx -= p.vx * k; p.vy -= p.vy * k;
-    }
-    // a battleship swings her bow with real inertia — the bow follows
-    // your thrust keys (full 360°, even at rest); velocity catches up
-    let wantFace = null;
-    if (il > 0) wantFace = Math.atan2(iy, ix);
-    else if (Math.hypot(p.vx, p.vy) > 8) wantFace = Math.atan2(p.vy, p.vx);
-    if (wantFace !== null) {
+    if (il > 0) {
+      const wantFace = Math.atan2(iy, ix);
       let diff = wantFace - p.face;
       while (diff > Math.PI) diff -= TAU;
       while (diff < -Math.PI) diff += TAU;
       p.face += clamp(diff, -d.turnRate * TICK, d.turnRate * TICK);
+      steer(p, Math.cos(p.face), Math.sin(p.face), maxSpd, d.inertia);
+    } else {
+      if (cmd.turn) p.face += cmd.turn * d.turnRate * TICK;
+      if (cmd.forward > 0) steer(p, Math.cos(p.face), Math.sin(p.face), maxSpd, d.inertia);
+      else if (cmd.forward < 0) steer(p, 0, 0, 0, d.inertia * 1.4);   // hard brake
+      else {
+        const k = 1 - Math.exp(-0.4 * TICK);
+        p.vx -= p.vx * k; p.vy -= p.vy * k;
+      }
     }
 
     // targeting
@@ -2496,7 +2498,7 @@ const Trinity = (() => {
     if (S.combo > 1 && S.comboT > 0)
       hudLine('KILL CHAIN ×' + S.combo, '#ffb35a', 'bold 13px Consolas,monospace');
     hudLine('KILLS ' + S.kills + '   ' + fmtTime(S.t), '#7d93a8', '11px Consolas,monospace');
-    hudLine('[WASD] thrust · [Shift] burn · [Tab] lock · [F] missile · [Space] WMG',
+    hudLine('[W] thrust [A/D] turn [S] brake · [Shift] burn · [F] msl · [Space] WMG',
       'rgba(110,130,150,0.75)', '10px Consolas,monospace');
     let ky = ty2 + 4;
     for (const k of killFeed) {
@@ -2834,7 +2836,7 @@ const Trinity = (() => {
     drawKey(x1 + 46, topY + 66, 'S');
     drawKey(x1 + 76, topY + 66, 'D');
     sctx.fillStyle = '#cfe0f0'; sctx.font = '12px Consolas,monospace'; sctx.textAlign = 'left';
-    sctx.fillText('Thrust — you keep inertia', x1 + 120, topY + 60);
+    sctx.fillText('W thrust · A/D turn · S brake', x1 + 120, topY + 60);
     const row = (y, key, txt) => {
       drawKey(x1 + 16, y, key);
       sctx.fillStyle = '#cfe0f0'; sctx.font = '12px Consolas,monospace'; sctx.textAlign = 'left';
@@ -2878,7 +2880,7 @@ const Trinity = (() => {
     let segs = null;
     switch (tut.step) {
       case 0:
-        segs = ['Hold ', { key: 'W' }, { key: 'A' }, { key: 'S' }, { key: 'D' }, ' to thrust — your ship drifts with inertia'];
+        segs = [{ key: 'W' }, ' thrust — ', { key: 'A' }, { key: 'D' }, ' swing the bow — ', { key: 'S' }, ' brakes'];
         if (Math.hypot(p.vx, p.vy) > 110) { tut.hold += dtF; if (tut.hold > 0.7) tut.step = 1; }
         break;
       case 1:
@@ -3589,14 +3591,15 @@ const Input = (() => {
   window.addEventListener('pointercancel', endPointer);
 
   function consume() {
-    let tx = 0, ty = 0;
-    if (held.has('w')) ty -= 1;
-    if (held.has('s')) ty += 1;
-    if (held.has('a')) tx -= 1;
-    if (held.has('d')) tx += 1;
+    let tx = 0, ty = 0, turn = 0, fwd = 0;
+    if (held.has('a')) turn -= 1;
+    if (held.has('d')) turn += 1;
+    if (held.has('w')) fwd += 1;
+    if (held.has('s')) fwd -= 1;
     if (joy.id !== null && Math.hypot(joy.dx, joy.dy) > 12) { tx = joy.dx; ty = joy.dy; }
     const cmd = {
       thrustX: tx, thrustY: ty,
+      turn, forward: fwd,
       ab: held.has('shift') || heldBtns.burn != null,
       wmg: held.has(' ') || heldBtns.wmg != null,
       heat: held.has('g') || heldBtns.heat != null,

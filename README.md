@@ -35,8 +35,8 @@ Enemy waves bring their own logistics ("Menders") that repair their fleet —
 The title screen shows every control, and your first flight walks you through them
 step by step. **P** pauses and brings the control reference back at any time.
 
-- **WASD** — thrust. Your ship is a space battleship in the spirit of the *Yamato* —
-  she keeps her inertia and swings her bow slowly; feather it.
+- **W** thrusts along the bow, **A/D** (or arrows) swing the bow, **S** brakes. Your
+  ship is a space battleship in the spirit of the *Yamato* — she keeps her inertia.
 - **Shift** — afterburner (drains capacitor).
 - **Space (hold)** — the **WAVE MOTION GUN**. Needs a full capacitor, slows you while
   charging, then erases everything in a 2.6 km corridor ahead of the bow. Long recharge.
