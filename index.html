@@ -3300,7 +3300,7 @@ const Trinity = (() => {
           + ' · best overtime ' + rec2.bestOT
           + (M2.veteran() ? ' · pre-flight fitting UNLOCKED' : ''), W / 2, Math.min(bottom + 62, H - 24));
       }
-      let hook = '[V] replay · [X] daily site · [T] CRT · [M] music · [O] photo';
+      let hook = '[V] replay · [X] daily site · [T] CRT · [O] photo';
       if (M2 && M2.unlocked())
         hook += ' · [B] VANGUARD ' + (M2.vanguardOn() ? 'ARMED' : 'off');
       sctx.fillStyle = M2 && M2.vanguardOn() ? '#ffb35a' : 'rgba(140,165,190,0.8)';
@@ -3717,12 +3717,7 @@ const Aura = (() => {
   let ac = null, master = null, noiseBuf = null, abGain = null;
   let droneGain = null, engGain = null, engFilter = null;
   let wmgOsc = null, wmgOscGain = null, wmgSwellGain = null, wmgSwellFilter = null;
-  let musicGain = null, mNext = 0, mStep = 0, musicOn = true, gunEcho = null;
-  try { musicOn = localStorage.getItem('cs_music') !== '0'; } catch (e) {}
-  // A-minor battle theme data: chords, a walking bass, a pentatonic arp
-  const CHORDS = [[0, 3, 7], [-2, 2, 5]];
-  const BASS = [0, -1, 0, -1, 3, -1, 0, -1, 5, -1, 3, -1, 7, -1, 5, 3];
-  const ARP = [0, 3, 5, 7, 10, 12, 10, 7];
+  let gunEcho = null;
   // soft-clip curve: drives the laser cannons into audible harmonics
   const satCurve = (() => {
     const n = 256, c = new Float32Array(n);
@@ -3743,7 +3738,6 @@ const Aura = (() => {
         comp.attack.value = 0.003; comp.release.value = 0.2;
         comp.connect(ac.destination);
         master = ac.createGain(); master.gain.value = 0.5; master.connect(comp);
-        musicGain = ac.createGain(); musicGain.gain.value = 0; musicGain.connect(master);
         // gun echo: a short damped feedback tail that makes energy weapons feel huge
         gunEcho = ac.createDelay(0.5); gunEcho.delayTime.value = 0.09;
         const efb = ac.createGain(); efb.gain.value = 0.32;
@@ -3823,33 +3817,6 @@ const Aura = (() => {
   }
 
   // schedule-at-time voices for the sequencer
-  function tone(t2, freq, dur, type, vol, filt, slideTo) {
-    if (!ac) return;
-    const o = ac.createOscillator(), g = ac.createGain();
-    o.type = type; o.frequency.setValueAtTime(freq, t2);
-    if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t2 + dur);
-    g.gain.setValueAtTime(0.0001, t2);
-    g.gain.linearRampToValueAtTime(vol, t2 + 0.012);
-    g.gain.exponentialRampToValueAtTime(0.0001, t2 + dur);
-    let node = o;
-    if (filt) {
-      const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = filt;
-      o.connect(f); node = f;
-    }
-    node.connect(g); g.connect(musicGain);
-    o.start(t2); o.stop(t2 + dur + 0.03);
-  }
-  function noiseAt(t2, dur, vol, bp) {
-    if (!ac) return;
-    const src = ac.createBufferSource(); src.buffer = noiseBuf;
-    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = bp; f.Q.value = 0.9;
-    const g = ac.createGain();
-    g.gain.setValueAtTime(vol, t2);
-    g.gain.exponentialRampToValueAtTime(0.0001, t2 + dur);
-    src.connect(f); f.connect(g); g.connect(musicGain);
-    src.start(t2); src.stop(t2 + dur);
-  }
-
   function handle(evts, S) {
     if (!ac) return;
     const px = S && S.player ? S.player.x : 0;
@@ -3951,53 +3918,9 @@ const Aura = (() => {
       wmgSwellGain.gain.setTargetAtTime(ch > 0 ? 0.02 + 0.13 * ch * ch : 0, t, 0.08);
       wmgSwellFilter.frequency.setTargetAtTime(300 + 2600 * ch, t, 0.08);
     }
-
-    // ---- the score: a step-sequenced battle theme that follows the fight ----
-    if (musicGain) {
-      const hn2 = S.ships ? S.ships.filter(s => s.alive && s.faction === 'hostile').length : 0;
-      const boss = S.ships && S.ships.some(s => s.alive && (s.cls === 'cruiser' || s.cls === 'dread'));
-      let inten = 0;
-      if (S.mode === 'play' && !S.paused) inten = boss ? 3 : hn2 >= 4 ? 2 : hn2 >= 1 ? 1 : 0;
-      const ducked = (S.wmg && S.wmg.charging) || S.beamT > 0;
-      musicGain.gain.setTargetAtTime(!musicOn ? 0 : ducked ? 0.08 : 0.55, t, ducked ? 0.05 : 0.6);
-      if (musicOn) {
-        const stepD = 60 / 112 / 4;   // 112 BPM, 16th notes
-        if (mNext < t) mNext = t + 0.05;   // resync after a tab-away
-        while (mNext < t + 0.15) {
-          const st2 = mStep % 16, bar = (mStep >> 4) % 2;
-          const semis = CHORDS[bar];
-          if (st2 === 0)   // pad
-            for (const sN of semis) tone(mNext, 110 * Math.pow(2, sN / 12), stepD * 16, 'sine', 0.06, 700);
-          if (st2 % 4 === 2)   // slow title arpeggio — the theme is always present
-            tone(mNext, 220 * Math.pow(2, ARP[((mStep >> 2) * 5) % ARP.length] / 12), stepD * 3.4, 'triangle', 0.05, 1200);
-          if (inten >= 1) {
-            if (st2 % 4 === 0) tone(mNext, 150, 0.1, 'sine', 0.16, 0, 48);   // kick
-            const bN = BASS[st2];
-            if (bN >= 0) tone(mNext, 55 * Math.pow(2, (bN + (bar ? -2 : 0)) / 12), stepD * 1.6, 'sawtooth', 0.09, 260);
-          }
-          if (inten >= 2) {
-            if (st2 === 4 || st2 === 12) noiseAt(mNext, 0.08, 0.08, 1900);   // snare
-            tone(mNext, 220 * Math.pow(2, ARP[(mStep * 3) % ARP.length] / 12), stepD * 0.9, 'triangle', 0.04, 1600);
-          }
-          if (inten >= 3 && st2 === 0)   // detuned brass stabs for the bosses
-            for (const sN of semis) {
-              tone(mNext, 110 * Math.pow(2, sN / 12), stepD * 6, 'sawtooth', 0.05, 900);
-              tone(mNext, 110 * Math.pow(2, sN / 12) * 1.007, stepD * 6, 'sawtooth', 0.04, 900);
-            }
-          mStep++; mNext += stepD;
-        }
-      }
-    }
   }
 
-  return {
-    ensure, handle, update,
-    toggleMusic: () => {
-      musicOn = !musicOn;
-      try { localStorage.setItem('cs_music', musicOn ? '1' : '0'); } catch (e) {}
-      return musicOn;
-    }
-  };
+  return { ensure, handle, update };
 })();
 
 /* =====================================================================
@@ -4064,7 +3987,7 @@ const Input = (() => {
       if (window.__savePhoto) window.__savePhoto();
       return;
     }
-    if (k === 'c' || k === 'v' || k === 'b' || k === 't' || k === 'x' || k === 'm' || k === 'o') {
+    if (k === 'c' || k === 'v' || k === 'b' || k === 't' || k === 'x' || k === 'o') {
       // meta keys never launch the game
       if (k === 'c' && window.__copyReplay) window.__copyReplay();
       if (k === 'v' && window.__watchReplay) window.__watchReplay();
@@ -4077,7 +4000,6 @@ const Input = (() => {
           ? 'DAILY SITE ' + Meta.todaySeed() + ' ARMED — the same battle for everyone today'
           : 'DAILY SITE OFF');
       }
-      if (k === 'm') Trinity.note('MUSIC ' + (Aura.toggleMusic() ? 'ON' : 'OFF'));
       if (k === 'o') {
         window.__photoOn = !window.__photoOn;
         Trinity.note(window.__photoOn ? 'PHOTO MODE — WASD pan · +/− zoom · Enter save · O exit' : 'PHOTO MODE OFF');
