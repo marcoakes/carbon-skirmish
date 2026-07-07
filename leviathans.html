@@ -14,7 +14,7 @@
 <script>
 "use strict";
 /* =====================================================================
-   LEVIATHANS — a capital-class carrier duel  [build v3.5-weight-and-drama]
+   LEVIATHANS — a capital-class carrier duel  [build v3.6-voice-bank]
    (companion piece to STAR BLAZERS: Carbon Skirmish — same DNA:
     a fixed-tick simulation that owns all state, a renderer that only
     reads it, and WebAudio synthesis for every sound. One file, no deps.)
@@ -385,7 +385,7 @@ const Sim = (() => {
           kind: 'shell', side: fr.side, x: fr.x, y: fr.y,
           vx: Math.cos(a) * 620, vy: Math.sin(a) * 620, dmg: 16, life: 2.0
         });
-        evt({ type: 'pew', x: fr.x, y: fr.y, side: fr.side });
+        evt({ type: 'pew', x: fr.x, y: fr.y, side: fr.side, role: 'FRG' });
         fr.gunCd = 3.2 + R() * 0.6;
       }
     }
@@ -443,7 +443,7 @@ const Sim = (() => {
       dmg, life: 0.55
     });
     f.ammo--; f.gunCd = ROLES[f.role].rof;
-    evt({ type: 'pew', x: f.x, y: f.y, side: f.side });
+    evt({ type: 'pew', x: f.x, y: f.y, side: f.side, role: f.role });
   }
 
   function tickFighter(f) {
@@ -2117,7 +2117,10 @@ const Render = (() => {
 
 /* =========================== [4] AUDIO =========================== */
 const Audio2 = (() => {
+  const USE_VOICE_BANK = true;   // flip false to restore pure live-synth sound
   let ac = null, master = null, noiseBuf = null, tension = null, drone = null, gunEcho = null;
+  let bedBus = null, heavyBus = null, bank = {}, bankKick = false, heavyVoices = [], stolen = 0;
+  let lightTimes = [], lightPlayed = 0, lightSkipped = 0;
   const satCurve = (() => { const n = 256, c = new Float32Array(n); for (let i = 0; i < n; i++) { const x = i / (n - 1) * 2 - 1; c[i] = Math.tanh(2.5 * x); } return c; })();
   function ensure() {
     if (!ac) {
@@ -2126,13 +2129,43 @@ const Audio2 = (() => {
         const comp = ac.createDynamicsCompressor();
         comp.threshold.value = -18; comp.ratio.value = 5; comp.attack.value = 0.003; comp.release.value = 0.2;
         comp.connect(ac.destination);
-        master = ac.createGain(); master.gain.value = 0.5; master.connect(comp);
-        // gun echo: a short damped feedback tail that makes the guns feel huge
+        // final soft limiter: a stacked barrage can never crackle
+        const lim = ac.createWaveShaper();
+        lim.curve = (() => {
+          const n = 1024, c2 = new Float32Array(n), k2 = Math.tanh(1.4);
+          for (let i = 0; i < n; i++) { const x2 = (i / (n - 1)) * 2 - 1; c2[i] = Math.tanh(1.4 * x2) / k2; }
+          return c2;
+        })();
+        lim.connect(comp);
+        master = ac.createGain(); master.gain.value = 0.5; master.connect(lim);
+        // bed bus (ambience + light one-shots) — duckable so big moments own the mix
+        bedBus = ac.createGain(); bedBus.connect(master);
+        // heavy-voice bus → shared convolution space: everything big lives in one room
+        heavyBus = ac.createGain(); heavyBus.gain.value = 0.95; heavyBus.connect(master);
+        const verb = ac.createConvolver();
+        {
+          const irLen = Math.ceil(1.8 * ac.sampleRate);
+          const ir = ac.createBuffer(2, irLen, ac.sampleRate);
+          for (let ch = 0; ch < 2; ch++) {
+            const d2 = ir.getChannelData(ch);
+            let lpv = 0;
+            for (let i = 0; i < irLen; i++) {
+              const t2 = i / irLen;
+              const w = (Math.random() * 2 - 1) * Math.exp(-4.2 * t2);
+              lpv += (w - lpv) * (0.12 + 0.5 * (1 - t2));   // the room darkens as it decays
+              d2[i] = lpv * (ch ? 0.92 : 1);
+            }
+          }
+          verb.buffer = ir;
+        }
+        const vs = ac.createGain(); vs.gain.value = 0.35;
+        heavyBus.connect(vs); vs.connect(verb); verb.connect(master);
+        // gun echo: a short damped feedback tail, now a parallel flavor under the verb
         gunEcho = ac.createDelay(0.5); gunEcho.delayTime.value = 0.09;
         const efb = ac.createGain(); efb.gain.value = 0.32;
         const edamp = ac.createBiquadFilter(); edamp.type = 'lowpass'; edamp.frequency.value = 2200;
         gunEcho.connect(edamp); edamp.connect(efb); efb.connect(gunEcho);
-        const eout = ac.createGain(); eout.gain.value = 0.45;
+        const eout = ac.createGain(); eout.gain.value = 0.3;
         edamp.connect(eout); eout.connect(master);
         noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
         const d = noiseBuf.getChannelData(0);
@@ -2140,20 +2173,29 @@ const Audio2 = (() => {
         const o1 = ac.createOscillator(), o2 = ac.createOscillator();
         drone = ac.createGain(); drone.gain.value = 0.018;
         o1.frequency.value = 48; o2.frequency.value = 48.6; o1.type = o2.type = 'sine';
-        o1.connect(drone); o2.connect(drone); drone.connect(master); o1.start(); o2.start();
+        o1.connect(drone); o2.connect(drone); drone.connect(bedBus); o1.start(); o2.start();
         const t1 = ac.createOscillator(), t2 = ac.createOscillator();
         tension = ac.createGain(); tension.gain.value = 0;
         t1.frequency.value = 110; t2.frequency.value = 116.5; t1.type = t2.type = 'sawtooth';
         const tf = ac.createBiquadFilter(); tf.type = 'lowpass'; tf.frequency.value = 420;
-        t1.connect(tf); t2.connect(tf); tf.connect(tension); tension.connect(master);
+        t1.connect(tf); t2.connect(tf); tf.connect(tension); tension.connect(bedBus);
         t1.start(); t2.start();
       } catch (e) {}
+      if (USE_VOICE_BANK) buildBank();   // fire and forget: buffers swap in as they render
     }
     if (ac && ac.state === 'suspended') ac.resume();
   }
   function out(pan) {
-    if (!pan || !ac.createStereoPanner) return master;
-    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); p.connect(master); return p;
+    const dest = bedBus || master;
+    if (!pan || !ac.createStereoPanner) return dest;
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); p.connect(dest); return p;
+  }
+  function duck() {   // big moments push the bed down, then it breathes back
+    if (!bedBus) return;
+    const t0 = ac.currentTime;
+    bedBus.gain.cancelScheduledValues(t0);
+    bedBus.gain.setTargetAtTime(0.42, t0, 0.04);
+    bedBus.gain.setTargetAtTime(1, t0 + 0.5, 0.8);
   }
   function blip(f, dur, type, vol, slide, pan) {
     if (!ac) return;
@@ -2203,33 +2245,272 @@ const Audio2 = (() => {
     blip(deep ? 88 : 130, deep ? 0.34 : 0.24, 'sine', deep ? 0.3 : 0.26, deep ? 26 : 40, pan);  // sub punch
     noise(0.07, deep ? 0.1 : 0.15, 6200, 1000, pan);                          // KSSH attack
   }
+
+  /* ---- the voice bank: synthesize offline like a studio, play like samples ---- */
+  // colored noise, computed sample-by-sample into a buffer
+  function coloredBuf(oc, dur, color) {
+    const b = oc.createBuffer(1, Math.ceil(dur * oc.sampleRate), oc.sampleRate);
+    const d = b.getChannelData(0);
+    let b0 = 0, b1 = 0, b2 = 0, last = 0;
+    for (let i = 0; i < d.length; i++) {
+      const w = Math.random() * 2 - 1;
+      if (color === 'brown') { last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; }
+      else if (color === 'pink') {
+        b0 = 0.997 * b0 + 0.029591 * w; b1 = 0.985 * b1 + 0.032534 * w; b2 = 0.95 * b2 + 0.048056 * w;
+        d[i] = (b0 + b1 + b2 + w * 0.05) * 2.2;
+      } else d[i] = w;
+    }
+    return b;
+  }
+  // offline voice helpers: noise sweep, tone, and FM metal (struck things should RING)
+  function oNz(oc, o) {
+    const src = oc.createBufferSource(); src.buffer = coloredBuf(oc, o.dur, o.color);
+    const f = oc.createBiquadFilter(); f.type = o.ftype || 'lowpass'; if (o.q) f.Q.value = o.q;
+    f.frequency.setValueAtTime(o.f0, o.t0);
+    if (o.f1) f.frequency.exponentialRampToValueAtTime(Math.max(20, o.f1), o.t0 + o.dur);
+    const g = oc.createGain();
+    g.gain.setValueAtTime(o.vol, o.t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, o.t0 + o.dur);
+    src.connect(f); f.connect(g); g.connect(o.dest || oc.destination);
+    src.start(o.t0);
+  }
+  function oTn(oc, o) {
+    const os = oc.createOscillator(), g = oc.createGain();
+    os.type = o.type; os.frequency.setValueAtTime(o.f0, o.t0);
+    if (o.f1) os.frequency.exponentialRampToValueAtTime(Math.max(18, o.f1), o.t0 + o.dur);
+    if (o.vib) {
+      const lf = oc.createOscillator(), lg = oc.createGain();
+      lf.frequency.value = o.vib; lg.gain.value = o.f0 * 0.12;
+      lf.connect(lg); lg.connect(os.frequency); lf.start(o.t0); lf.stop(o.t0 + o.dur);
+    }
+    g.gain.setValueAtTime(o.vol, o.t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, o.t0 + o.dur);
+    os.connect(g); g.connect(o.dest || oc.destination);
+    os.start(o.t0); os.stop(o.t0 + o.dur + 0.02);
+  }
+  function oFM(oc, o) {
+    const c = oc.createOscillator(), m = oc.createOscillator(), mg = oc.createGain(), g = oc.createGain();
+    c.frequency.value = o.fc;
+    m.frequency.setValueAtTime(o.fc * o.ratio, o.t0);
+    if (o.drift) m.frequency.linearRampToValueAtTime(o.fc * o.ratio * o.drift, o.t0 + o.dur);
+    mg.gain.setValueAtTime(o.fc * o.index, o.t0);
+    mg.gain.exponentialRampToValueAtTime(1, o.t0 + o.dur * 0.7);
+    m.connect(mg); mg.connect(c.frequency);
+    g.gain.setValueAtTime(o.vol, o.t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, o.t0 + o.dur);
+    c.connect(g); g.connect(o.dest || oc.destination);
+    c.start(o.t0); c.stop(o.t0 + o.dur); m.start(o.t0); m.stop(o.t0 + o.dur);
+  }
+  function oSat(oc) {   // saturation stage inside a render
+    const sh = oc.createWaveShaper(); sh.curve = satCurve;
+    const g = oc.createGain(); g.gain.value = 0.85;
+    sh.connect(g); g.connect(oc.destination);
+    return sh;
+  }
+
+  async function buildBank() {
+    if (bankKick || !ac) return;
+    bankKick = true;
+    const sr = ac.sampleRate;
+    const mk = async (fam, dur, n, fn) => {
+      const list = [];
+      for (let v = 0; v < n; v++) {
+        try {
+          const oc = new OfflineAudioContext(2, Math.ceil(dur * sr), sr);
+          fn(oc, 0.94 + v * 0.07 + Math.random() * 0.04);   // per-variant pitch seed
+          list.push(await oc.startRendering());
+        } catch (e2) {}
+      }
+      if (list.length) bank[fam] = list;
+    };
+    const broadside = (deep) => (oc, j) => {
+      const p = j * (deep ? 0.62 : 1), sat = oSat(oc);
+      oNz(oc, { t0: 0, dur: 0.07, color: 'white', ftype: 'highpass', f0: 5000, f1: 1400, vol: 0.5 });        // KSSH
+      oFM(oc, { t0: 0, fc: 320 * p, ratio: 2.76, index: 8, dur: 0.2, vol: 0.22 });                            // breech clank
+      oTn(oc, { t0: 0.01, type: 'sawtooth', f0: 2100 * p, f1: 140 * p, dur: deep ? 0.42 : 0.3, vol: 0.15, vib: 42, dest: sat });
+      oTn(oc, { t0: 0.01, type: 'square', f0: 1050 * p, f1: 70 * p, dur: deep ? 0.32 : 0.22, vol: 0.08, dest: sat });
+      oTn(oc, { t0: 0, type: 'sine', f0: 130 * p, f1: 34, dur: deep ? 0.4 : 0.3, vol: deep ? 0.5 : 0.42 });   // sub punch
+      oNz(oc, { t0: 0.02, dur: 0.9, color: 'pink', f0: 900 * p, f1: 110, vol: 0.5 });                          // concussion bloom
+      oNz(oc, { t0: 0.15, dur: deep ? 1.6 : 1.3, color: 'pink', f0: 420, f1: 55, vol: 0.2 });                  // tail
+    };
+    const boom = (big) => (oc, j) => {
+      oNz(oc, { t0: 0, dur: big ? 0.06 : 0.05, color: 'white', f0: 5200 * j, f1: 800, vol: big ? 0.45 : 0.33 });
+      oNz(oc, { t0: 0.01, dur: big ? 0.8 : 0.5, color: 'pink', f0: 1300 * j, f1: 140, vol: big ? 0.55 : 0.45 });
+      oNz(oc, { t0: 0.08, dur: big ? 1.9 : 1.0, color: 'brown', f0: 320, f1: 45, vol: big ? 0.55 : 0.38 });
+      oTn(oc, { t0: 0.01, type: 'sine', f0: (big ? 74 : 92) * j, f1: big ? 23 : 30, dur: big ? 1.4 : 0.6, vol: big ? 0.5 : 0.34 });
+      if (big) oFM(oc, { t0: 0.05, fc: 620 * j, ratio: 3.7, index: 5, dur: 0.6, vol: 0.07, drift: 0.8 });      // shrapnel ring
+    };
+    // light families first: they are heard in the opening seconds
+    const laser = (deep) => (oc, j) => {
+      const p = j * (deep ? 0.75 : 1), sat = oSat(oc);
+      oNz(oc, { t0: 0, dur: 0.03, color: 'white', ftype: 'highpass', f0: 4500, f1: 2000, vol: deep ? 0.2 : 0.14 });  // zap texture
+      oTn(oc, { t0: 0, type: 'sawtooth', f0: 1900 * p, f1: 350 * p, dur: 0.07, vol: 0.16, dest: sat });
+      oTn(oc, { t0: 0.004, type: 'sawtooth', f0: 2540 * p, f1: 470 * p, dur: 0.055, vol: 0.07, dest: sat });
+      oTn(oc, { t0: 0, type: 'sine', f0: 90 * p, f1: 45, dur: 0.06, vol: 0.22 });                                    // body tick
+    };
+    await mk('laser_P', 0.24, 4, laser(false));
+    await mk('laser_E', 0.24, 4, laser(true));
+    await mk('pdtick', 0.16, 2, (oc, j) => {   // a mechanical brrt, not a beep
+      for (const tt of [0, 0.035])
+        oNz(oc, { t0: tt, dur: 0.035, color: 'pink', ftype: 'bandpass', q: 1.4, f0: 2000 * j, f1: 900, vol: 0.3 });
+    });
+    await mk('broadside_P', 1.7, 3, broadside(false));
+    await mk('broadside_E', 2.1, 3, broadside(true));
+    await mk('boom_small', 1.2, 2, boom(false));
+    await mk('boom_big', 2.6, 2, boom(true));
+    await mk('carrierdeath', 5.6, 1, (oc, j) => {
+      boom(true)(oc, j);
+      for (const [tt, sc] of [[0.55, 0.8], [0.95, 0.65], [1.6, 0.9], [2.35, 0.55], [3.1, 0.7]]) {
+        oNz(oc, { t0: tt, dur: 0.7 * sc + 0.3, color: 'pink', f0: 1100 * sc, f1: 120, vol: 0.4 * sc });
+        oTn(oc, { t0: tt, type: 'sine', f0: 88 * sc + 30, f1: 26, dur: 0.8, vol: 0.3 * sc });
+      }
+      oFM(oc, { t0: 0.4, fc: 62, ratio: 1.43, index: 11, dur: 2.8, vol: 0.13, drift: 2.3 });    // the hull groans
+      oFM(oc, { t0: 1.5, fc: 84, ratio: 2.1, index: 9, dur: 2.6, vol: 0.1, drift: 1.7 });
+      oNz(oc, { t0: 0.4, dur: 4.8, color: 'brown', f0: 240, f1: 30, vol: 0.5 });
+      oTn(oc, { t0: 0.2, type: 'sine', f0: 44, f1: 17, dur: 3.2, vol: 0.42 });
+    });
+    await mk('wmgfire', 4.2, 1, (oc, j) => {
+      const sat = oSat(oc);
+      oNz(oc, { t0: 0, dur: 2.3, color: 'white', f0: 1500 * j, f1: 45, vol: 0.5 });               // the shred
+      for (const dt2 of [-7, -3, 2, 6])
+        oTn(oc, { t0: 0.02, type: 'sawtooth', f0: 220 + dt2, f1: 36, dur: 1.5, vol: 0.08, dest: sat });
+      oTn(oc, { t0: 0, type: 'sine', f0: 34, f1: 15, dur: 2.8, vol: 0.5 });                       // sub drop
+      oNz(oc, { t0: 0.6, dur: 3.4, color: 'brown', f0: 300, f1: 35, vol: 0.32 });
+      oNz(oc, { t0: 0, dur: 0.35, color: 'white', ftype: 'highpass', f0: 3800, f1: 9000, vol: 0.16 });
+    });
+    await mk('spinal', 1.5, 2, (oc, j) => {
+      oFM(oc, { t0: 0, fc: 210 * j, ratio: 2.3, index: 6, dur: 0.16, vol: 0.26 });                // tube clank
+      oNz(oc, { t0: 0.03, dur: 0.45, color: 'white', f0: 950, f1: 110, vol: 0.26 });              // hydraulics
+      oNz(oc, { t0: 0.2, dur: 0.9, color: 'pink', ftype: 'bandpass', q: 1.1, f0: 380, f1: 1600, vol: 0.2 });  // drive-away
+      oTn(oc, { t0: 0, type: 'sine', f0: 62 * j, f1: 30, dur: 0.4, vol: 0.3 });
+    });
+    await mk('msl', 1.7, 2, (oc, j) => {
+      for (let i = 0; i < 8; i++) {
+        const tt = i * 0.085 + Math.random() * 0.03;
+        oNz(oc, { t0: tt, dur: 0.22, color: 'white', f0: 2100 * j, f1: 380, vol: 0.13 });
+        oTn(oc, { t0: tt, type: 'sawtooth', f0: 300, f1: 900, dur: 0.16, vol: 0.03 });
+      }
+      oNz(oc, { t0: 0.3, dur: 1.2, color: 'pink', f0: 600, f1: 90, vol: 0.14 });
+    });
+    await mk('subkill', 2.3, 1, (oc, j) => {
+      oFM(oc, { t0: 0, fc: 140 * j, ratio: 3.1, index: 7, dur: 1.7, vol: 0.3, drift: 0.6 });      // the ring
+      oNz(oc, { t0: 0, dur: 1.6, color: 'brown', f0: 520, f1: 55, vol: 0.42 });
+      oTn(oc, { t0: 0, type: 'sine', f0: 56, f1: 21, dur: 1.1, vol: 0.4 });
+    });
+    await mk('frigatedown', 2.4, 2, (oc, j) => {
+      boom(false)(oc, j);
+      oFM(oc, { t0: 0.15, fc: 96 * j, ratio: 1.8, index: 9, dur: 1.7, vol: 0.11, drift: 2.1 });
+      oNz(oc, { t0: 0.2, dur: 1.9, color: 'brown', f0: 260, f1: 34, vol: 0.35 });
+    });
+  }
+
+  // play a banked voice with distance and a strict budget of heavy throats
+  function playVoice(fam, pan, d2) {
+    const list = bank[fam];
+    if (!USE_VOICE_BANK || !list || !list.length) return false;
+    const src = ac.createBufferSource();
+    src.buffer = list[(Math.random() * list.length) | 0];
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass';
+    lp.frequency.value = 1400 + 15000 * Math.pow(0.22, (d2 || 0) / 2400);   // far fights sound far
+    const g = ac.createGain();
+    g.gain.value = clamp(1.15 - (d2 || 0) / 2600, 0.3, 1);
+    src.connect(lp); lp.connect(g);
+    if (pan && ac.createStereoPanner) {
+      const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1);
+      g.connect(p); p.connect(heavyBus);
+    } else g.connect(heavyBus);
+    heavyVoices = heavyVoices.filter(v => v.on);
+    if (heavyVoices.length >= 3) {   // steal the oldest throat, fade so it never clicks
+      const old = heavyVoices.shift(); stolen++;
+      old.g.gain.setTargetAtTime(0, ac.currentTime, 0.02);
+      try { old.src.stop(ac.currentTime + 0.06); } catch (e2) {}
+    }
+    const rec = { src, g, on: true };
+    src.onended = () => { rec.on = false; };
+    heavyVoices.push(rec);
+    src.start();
+    return true;
+  }
+
+  // light voices: density-limited so a furball is a soundscape, not an alarm clock
+  function playLight(fam, pan, rate) {
+    const t2 = performance.now();
+    lightTimes = lightTimes.filter(x => t2 - x < 200);
+    if (lightTimes.length >= 8) { lightSkipped++; return true; }   // wall of fire: swallow the rest
+    const dens = lightTimes.length;
+    lightTimes.push(t2);
+    const list = bank[fam];
+    if (!USE_VOICE_BANK || !list || !list.length) return false;
+    const src = ac.createBufferSource();
+    src.buffer = list[(Math.random() * list.length) | 0];
+    src.playbackRate.value = (rate || 1) * (0.94 + Math.random() * 0.12);
+    const g = ac.createGain();
+    g.gain.value = dens < 3 ? 1 : dens < 5 ? 0.5 : 0.3;
+    src.connect(g);
+    if (pan && ac.createStereoPanner) {
+      const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1);
+      g.connect(p); p.connect(bedBus);
+    } else g.connect(bedBus);
+    src.start(); lightPlayed++;
+    return true;
+  }
+  function laserLive(pan, deep) {   // pre-bank fallback: a chirp with harmonics, never a square beep
+    if (!ac) return;
+    const t0 = ac.currentTime, sh = ac.createWaveShaper(); sh.curve = satCurve;
+    const cg = ac.createGain(); cg.gain.value = 0.5; sh.connect(cg); cg.connect(out(pan));
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = 'sawtooth';
+    o.frequency.setValueAtTime((deep ? 1300 : 1900) * (0.94 + Math.random() * 0.12), t0);
+    o.frequency.exponentialRampToValueAtTime(deep ? 260 : 350, t0 + 0.07);
+    g.gain.setValueAtTime(0.05, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.09);
+    o.connect(g); g.connect(sh); o.start(t0); o.stop(t0 + 0.1);
+  }
   function handle(evts, S) {
     if (!ac) return;
     const px = S.P.x;
     for (const e of evts) {
       const pan = e.x != null ? clamp((e.x - px) / 1400, -0.85, 0.85) : 0;
+      const dd = e.x != null ? Math.hypot(e.x - S.P.x, e.y - S.P.y) : 0;
       switch (e.type) {
-        case 'pew': blip(e.side === 'P' ? 620 : 480, 0.05, 'square', 0.018, 240, pan); break;
-        case 'pd': if (Math.random() < 0.35) blip(1400, 0.03, 'square', 0.014, 700, pan); break;
-        case 'broadside': cannon(pan, e.side === 'E'); break;
+        case 'pew': {
+          const deep = e.side !== 'P';
+          const rate = e.role === 'BMB' ? 0.78 : e.role === 'FRG' ? 0.7 : 1;   // bombers/frigates fire heavier
+          if (!playLight(deep ? 'laser_E' : 'laser_P', pan, rate)) laserLive(pan, deep);
+          break;
+        }
+        case 'pd': if (Math.random() < 0.35) { if (!playLight('pdtick', pan, 1)) blip(1400, 0.03, 'square', 0.014, 700, pan); } break;
+        case 'broadside':
+          if (!playVoice(e.side === 'E' ? 'broadside_E' : 'broadside_P', pan, dd)) cannon(pan, e.side === 'E');
+          break;
         case 'spinal':
-          if (e.side === 'P') {   // mechanical launch: thunk, hydraulics, drive whoosh
+          if (!playVoice('spinal', pan, dd)) {
             blip(64, 0.12, 'square', 0.16, 40, pan);
             noise(0.4, 0.22, 900, 110, pan);
             blip(180, 0.55, 'triangle', 0.06, 38, pan);
-          } else { blip(90, 0.5, 'sine', 0.3, 26, pan); noise(0.45, 0.2, 500, 60, pan); }
+          }
           break;
         case 'ace': blip(1046, 0.16, 'sine', 0.07); blip(1568, 0.3, 'sine', 0.07); break;
         case 'rockhit': if (Math.random() < 0.6) noise(0.2, 0.1, 700, 90, pan); break;
-        case 'msl': noise(0.5, 0.16, 600, 3000, pan); blip(340, 0.3, 'triangle', 0.06, 900, pan); break;
+        case 'msl':
+          if (!playVoice('msl', pan, dd)) { noise(0.5, 0.16, 600, 3000, pan); blip(340, 0.3, 'triangle', 0.06, 900, pan); }
+          break;
         case 'wmgcharge': blip(70, 2.2, 'sawtooth', 0.08, 950); break;
-        case 'wmgfire': noise(2.2, 0.55, 1400, 40); blip(30, 2.6, 'sine', 0.45, 16); blip(220, 1.2, 'sawtooth', 0.12, 30); break;
-        case 'boom': noise(e.big ? 1.6 : 0.5, e.big ? 0.5 : 0.22, 900, 45, pan); if (e.big) blip(60, 1.2, 'sine', 0.3, 24, pan); break;
+        case 'wmgfire':
+          duck();
+          if (!playVoice('wmgfire', 0, 0)) { noise(2.2, 0.55, 1400, 40); blip(30, 2.6, 'sine', 0.45, 16); blip(220, 1.2, 'sawtooth', 0.12, 30); }
+          break;
+        case 'boom':
+          if (!playVoice(e.big ? 'boom_big' : 'boom_small', pan, dd)) {
+            noise(e.big ? 1.6 : 0.5, e.big ? 0.5 : 0.22, 900, 45, pan);
+            if (e.big) blip(60, 1.2, 'sine', 0.3, 24, pan);
+          }
+          break;
         case 'shield': blip(900, 0.08, 'triangle', 0.05, 500, pan); break;
         case 'armorhit': noise(0.1, 0.06, 900, 200, pan); break;
         case 'subdown':
           blip(880, 0.5, 'square', 0.09, 870); blip(660, 0.7, 'square', 0.09, 650);   // two-tone alarm
-          if (e.side === 'E') { noise(1.2, 0.4, 700, 40, pan); blip(50, 1.0, 'sine', 0.3, 20, pan); }   // your kill: a real thump
+          if (e.side === 'E' && !playVoice('subkill', pan, dd)) { noise(1.2, 0.4, 700, 40, pan); blip(50, 1.0, 'sine', 0.3, 20, pan); }
           break;
         case 'subup': blip(520, 0.2, 'sine', 0.06, 780); break;
         case 'dock': blip(700, 0.12, 'sine', 0.06, 1050, pan); break;
@@ -2239,9 +2520,14 @@ const Audio2 = (() => {
         case 'launch': noise(0.5, 0.14, 600, 2600, pan); break;
         case 'order': blip(740, 0.06, 'sine', 0.05, 950); break;
         case 'blip': blip(980, 0.04, 'sine', 0.04); break;
-        case 'carrierdeath': noise(2.6, 0.55, 1200, 30, pan); blip(38, 2.6, 'sine', 0.4, 16, pan); break;
-        case 'frigatedown': noise(0.9, 0.35, 900, 45, pan); blip(70, 0.9, 'sine', 0.2, 26, pan); break;
-        case 'stage2': blip(880, 0.5, 'square', 0.09, 870); blip(660, 0.7, 'square', 0.09, 650); noise(1.4, 0.3, 900, 60); break;
+        case 'carrierdeath':
+          duck();
+          if (!playVoice('carrierdeath', pan, dd)) { noise(2.6, 0.55, 1200, 30, pan); blip(38, 2.6, 'sine', 0.4, 16, pan); }
+          break;
+        case 'frigatedown':
+          if (!playVoice('frigatedown', pan, dd)) { noise(0.9, 0.35, 900, 45, pan); blip(70, 0.9, 'sine', 0.2, 26, pan); }
+          break;
+        case 'stage2': duck(); blip(880, 0.5, 'square', 0.09, 870); blip(660, 0.7, 'square', 0.09, 650); noise(1.4, 0.3, 900, 60); break;
         case 'fighterdown': blip(300, 0.25, 'sawtooth', 0.05, 70, pan); break;
         case 'battle': blip(340, 0.4, 'sine', 0.07, 500); break;
       }
@@ -2252,7 +2538,16 @@ const Audio2 = (() => {
     const danger = Math.max(1 - S.P.hull / S.P.hullMax, 1 - S.E.hull / S.E.hullMax);
     tension.gain.setTargetAtTime(S.mode === 'play' ? danger * 0.05 : 0, ac.currentTime, 0.8);
   }
-  return { ensure, handle, update };
+  return {
+    ensure, handle, update,
+    bankStatus: () => {
+      const fams = ['laser_P', 'laser_E', 'pdtick', 'broadside_P', 'broadside_E', 'boom_small', 'boom_big', 'carrierdeath', 'wmgfire', 'spinal', 'msl', 'subkill', 'frigatedown'];
+      const st = {};
+      for (const f of fams) st[f] = bank[f] ? bank[f].length : 0;
+      return st;
+    },
+    debug: () => ({ stolen, active: heavyVoices.filter(v => v.on).length, lightPlayed, lightSkipped })
+  };
 })();
 
 /* ======================= [5] INPUT & MAIN ======================= */
