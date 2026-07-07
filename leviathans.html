@@ -14,7 +14,7 @@
 <script>
 "use strict";
 /* =====================================================================
-   LEVIATHANS — a capital-class carrier duel  [build v3.4-gunnery-school]
+   LEVIATHANS — a capital-class carrier duel  [build v3.5-weight-and-drama]
    (companion piece to STAR BLAZERS: Carbon Skirmish — same DNA:
     a fixed-tick simulation that owns all state, a renderer that only
     reads it, and WebAudio synthesis for every sound. One file, no deps.)
@@ -97,8 +97,10 @@ const Sim = (() => {
   function makeFighter(side, squad, slot) {
     const role = ROLES[SQUADS[squad]];
     const hp = Math.round(role.hp * (side === 'P' ? 1.25 : 1));   // veteran crews
+    const CSN = { INT: 'DAGGER', BMB: 'HAMMER', DEF: 'SHIELD' };
     return {
       id: nextId++, side, squad, slot, role: SQUADS[squad],
+      cs: side === 'P' ? CSN[SQUADS[squad]] + '-' + (slot + 1) : null, kills: 0,
       x: 0, y: 0, vx: 0, vy: 0, face: 0,
       hp, max: hp, ammo: role.ammo, ammoMax: role.ammo,
       state: 'docked', order: 'defend', gunCd: R(), runT: 0, tId: 0,
@@ -132,6 +134,23 @@ const Sim = (() => {
       for (let sl = 0; sl < 6; sl++) S.fighters.push(makeFighter('E', sq, sl));
     }
     for (const sd of ['P', 'E']) for (let i = 0; i < 2; i++) S.frigates.push(makeFrigate(sd, i));
+    // the belt: a band of debris across mid-arena — cover, if you use it
+    S.rocks = [];
+    {
+      const ba = (0.25 + R() * 0.5) * Math.PI + (R() < 0.5 ? Math.PI : 0);   // steep to the carrier axis
+      const bx2 = Math.cos(ba), by2 = Math.sin(ba);
+      const gap2 = (R() < 0.5 ? -1 : 1) * (700 + R() * 700);                 // second clear gap
+      for (let i = 0; i < 46; i++) {
+        const t2 = -1700 + i * 74 + (R() - 0.5) * 40;
+        if (Math.abs(t2) < 300 || Math.abs(t2 - gap2) < 240) continue;       // the gaps
+        const off = (R() - 0.5) * 420;
+        S.rocks.push({
+          x: bx2 * t2 - by2 * off, y: by2 * t2 + bx2 * off,
+          r: 25 + R() * 45, seed: R() * 100, vr: (R() - 0.5) * 0.3
+        });
+      }
+    }
+    S.topGun = null;
     return S;
   }
 
@@ -147,7 +166,7 @@ const Sim = (() => {
   function hitCarrier(c, dmg, x, y, forceSub, pierce) {
     if (c.dead) return;
     if (c.side === 'P') { dmg *= S.diff.dmgMul; S.stats.taken += dmg; }
-    else S.stats.dealt += dmg;
+    else { S.stats.dealt += dmg; evt({ type: 'dmg', x, y, amt: dmg, shield: c.shield > 0 }); }
     if (c.shield > 0) {
       if (pierce) {   // torpedoes detonate on contact: shields only blunt them
         c.shield = Math.max(0, c.shield - dmg * 0.6);
@@ -272,11 +291,15 @@ const Sim = (() => {
     c.broadCd -= TICK; c.spinalCd -= TICK; c.launchCd -= TICK; c.missCd -= TICK;
   }
 
-  function killFighter(f) {
+  function killFighter(f, killerId) {
     f.alive = false; f.state = 'dead';
     evt({ type: 'boom', x: f.x, y: f.y, r: 12 });
-    evt({ type: 'fighterdown', side: f.side });
+    evt({ type: 'fighterdown', side: f.side, cs: f.cs });
     if (f.side === 'P') S.stats.lost++;
+    if (killerId) {
+      const k = S.fighters.find(g => g.id === killerId && g.alive);
+      if (k) { k.kills++; if (k.side === 'P' && k.kills === 5) evt({ type: 'ace', cs: k.cs }); }
+    }
   }
 
   // ---- escort frigates: two pickets per side — a screen, not a fleet ----
@@ -415,7 +438,7 @@ const Sim = (() => {
   function fireF(f, tx, ty, dmg, kind) {
     const a = Math.atan2(ty - f.y, tx - f.x) + (R() - 0.5) * 0.09;
     S.projectiles.push({
-      kind, side: f.side, x: f.x, y: f.y,
+      kind, side: f.side, x: f.x, y: f.y, sid: f.id,
       vx: Math.cos(a) * 880 + f.vx * 0.3, vy: Math.sin(a) * 880 + f.vy * 0.3,
       dmg, life: 0.55
     });
@@ -556,6 +579,14 @@ const Sim = (() => {
         pr.vx = Math.cos(na) * 150; pr.vy = Math.sin(na) * 150;
         pr.x += pr.vx * TICK; pr.y += pr.vy * TICK;
         pr.life -= TICK;
+        // debris kills torpedoes
+        for (const rk of S.rocks) if (dist(pr.x, pr.y, rk.x, rk.y) < rk.r) {
+          pr.dead = true;
+          evt({ type: 'boom', x: pr.x, y: pr.y, r: 16 });
+          evt({ type: 'rockhit', x: pr.x, y: pr.y });
+          break;
+        }
+        if (pr.dead) continue;
         // pickets can body-block a torpedo — that is their job
         for (const fr of S.frigates) {
           if (fr.dead || fr.side === pr.side) continue;
@@ -568,8 +599,9 @@ const Sim = (() => {
         }
         if (pr.dead) continue;
         if (dist(pr.x, pr.y, tp.x, tp.y) < 46) {
-          pr.dead = true;
+          pr.dead = true; pr.resolved = true;
           evt({ type: 'boom', x: pr.x, y: pr.y, r: 26, big: true });
+          if (pr.side === 'P') evt({ type: 'torphit', sub: pr.sub });
           hitCarrier(foe, pr.dmg, pr.x, pr.y, pr.sub, true);
         } else if (pr.life <= 0) pr.dead = true;
         continue;
@@ -587,6 +619,10 @@ const Sim = (() => {
         pr.vx = Math.cos(na) * pr.spd; pr.vy = Math.sin(na) * pr.spd;
         pr.x += pr.vx * TICK; pr.y += pr.vy * TICK;
         pr.life -= TICK;
+        for (const rk of S.rocks) if (dist(pr.x, pr.y, rk.x, rk.y) < rk.r) {
+          pr.dead = true; evt({ type: 'rockhit', x: pr.x, y: pr.y }); break;
+        }
+        if (pr.dead) continue;
         if (ft && dist(pr.x, pr.y, ft.x, ft.y) < 16) {
           pr.dead = true; ft.hp -= pr.dmg;
           evt({ type: 'boom', x: pr.x, y: pr.y, r: 8 });
@@ -601,6 +637,13 @@ const Sim = (() => {
       pr.x += pr.vx * TICK; pr.y += pr.vy * TICK;
       pr.life -= TICK;
       if (pr.life <= 0) { pr.dead = true; continue; }
+      // shells shatter on the belt
+      if (pr.kind === 'shell') {
+        for (const rk of S.rocks) if (dist(pr.x, pr.y, rk.x, rk.y) < rk.r) {
+          pr.dead = true; evt({ type: 'rockhit', x: pr.x, y: pr.y }); break;
+        }
+        if (pr.dead) continue;
+      }
       // vs fighters
       if (pr.kind === 'fslug' || pr.kind === 'shell') {
         for (const f of S.fighters) {
@@ -609,7 +652,7 @@ const Sim = (() => {
             pr.dead = true;
             f.hp -= pr.dmg;
             evt({ type: 'fhit', x: f.x, y: f.y });
-            if (f.hp <= 0) killFighter(f);
+            if (f.hp <= 0) killFighter(f, pr.sid);
             break;
           }
         }
@@ -633,6 +676,9 @@ const Sim = (() => {
         hitCarrier(foe, pr.dmg, pr.x, pr.y);
       }
     }
+    // report the fate of every player torpedo that did not reach its mark
+    for (const pr of S.projectiles)
+      if (pr.dead && pr.kind === 'storp' && pr.side === 'P' && !pr.resolved) evt({ type: 'torpdown' });
     S.projectiles = S.projectiles.filter(p => !p.dead);
   }
 
@@ -660,7 +706,7 @@ const Sim = (() => {
         vx: Math.cos(a) * 620, vy: Math.sin(a) * 620,
         dmg: 62 * pw(c, 'weapons'), life: 2.8, delay: i * 0.05
       });
-      evt({ type: 'broadside', x: bx, y: by, i });
+      evt({ type: 'broadside', x: bx, y: by, i, side: c.side });
     });
     return true;
   }
@@ -669,7 +715,7 @@ const Sim = (() => {
     const foe = foeOf(c);
     if (dist(c.x, c.y, foe.x, foe.y) > 2100) return false;
     c.spinalCd = 16;
-    if (c === S.P) S.tutTorp = true;
+    if (c === S.P) { S.tutTorp = true; evt({ type: 'torplaunch', sub: c.targetSub }); }
     for (let i = 0; i < 3; i++) {
       const a = c.face + (i - 1) * 0.14;
       S.projectiles.push({
@@ -737,6 +783,13 @@ const Sim = (() => {
 
   // ---- the enemy admiral: a mirror who actually thinks ----
   const tutHold = () => S.diffIdx === 0 && !S.tutSkip && S.tut < 10 && S.t < 130;
+  const lineBlocked = (x1, y1, x2, y2) => {
+    for (let i = 1; i <= 5; i++) {
+      const x = x1 + (x2 - x1) * i / 6, y = y1 + (y2 - y1) * i / 6;
+      for (const rk of S.rocks) if (dist(x, y, rk.x, rk.y) < rk.r + 40) return true;
+    }
+    return false;
+  };
   function tickAI() {
     const E = S.E, P = S.P;
     if (E.dead) return;
@@ -756,8 +809,9 @@ const Sim = (() => {
     const spd = 115 * pw(E, 'engines') * (E.subs.engines.disabled ? 0.18 : 1);
     E.face += clamp(wrapA(wantFace - E.face), -0.85 * TICK, 0.85 * TICK);
     const push = d > want + 80 ? 1 : d < want - 80 ? -1 : 0;
-    // orbital strafe: transversal is armor — the admiral knows it too
-    const tang = 0.55 * S.diff.aggro;
+    // orbital strafe: transversal is armor — the admiral knows it too.
+    // if the belt blocks the firing line, slide harder along it toward a gap
+    const tang = (lineBlocked(E.x, E.y, P.x, P.y) ? 1.0 : 0.55) * S.diff.aggro;
     const k = 1 - Math.exp(-0.85 * TICK);
     E.vx += ((Math.cos(toP) * push - Math.sin(toP) * flank * tang) * spd - E.vx) * k;
     E.vy += ((Math.sin(toP) * push + Math.cos(toP) * flank * tang) * spd - E.vy) * k;
@@ -957,6 +1011,11 @@ const Sim = (() => {
       if (S.newBest) r.best = S.score;
       r.saved += st.saved; r.lost += st.lost;
       if (S.perfect) r.perfect++;
+      let tg = null;
+      for (const f of S.fighters)
+        if (f.side === 'P' && f.kills > (tg ? tg.kills : 0)) tg = { cs: f.cs, kills: f.kills };
+      S.topGun = tg;
+      if (tg && (!r.ace || tg.kills > r.ace.kills)) r.ace = { cs: tg.cs, kills: tg.kills };
       try { localStorage.setItem('lev_record', JSON.stringify(r)); } catch (e) {}
     }
   }
@@ -1279,12 +1338,33 @@ const Render = (() => {
         case 'spinal': flashes.push({ x: e.x, y: e.y, r: 120, life: 0.3, max: 0.3, img: GLOW.teal }); shake = Math.min(26, shake + 10); break;
         case 'msl': flashes.push({ x: e.x, y: e.y, r: 60, life: 0.15, max: 0.15, img: GLOW.blue }); break;
         case 'wmgfire': flashes.push({ x: e.x, y: e.y, r: 300, life: 0.3, max: 0.3, img: GLOW.white }); shake = Math.min(26, shake + 22); break;
-        case 'subdown': boom(e.x || 0, e.y || 0, 20, false); if (e.side === 'P') redF = 0.5; break;
+        case 'subdown':
+          boom(e.x || 0, e.y || 0, 20, false);
+          if (e.side === 'P') redF = 0.5;
+          else subKillFlash = { txt: 'SUBSYSTEM DESTROYED — ' + Sim.SUBS[e.key].label, t: 2.5 };
+          break;
         case 'carrierdeath': boom(e.c.x, e.c.y, 60, true); boom(e.c.x + 80, e.c.y + 40, 40, true); boom(e.c.x - 90, e.c.y - 30, 40, true); break;
-        case 'fighterdown': if (e.side === 'P') redF = Math.min(0.5, redF + 0.18); break;
+        case 'fighterdown':
+          if (e.side === 'P') { redF = Math.min(0.5, redF + 0.18); if (e.cs) tpush(e.cs + ' IS DOWN', 3); }
+          break;
         case 'frigatedown': boom(e.x, e.y, 26, true); if (e.side === 'P') redF = Math.min(0.5, redF + 0.25); break;
         case 'stage2': flashes.push({ x: e.x, y: e.y, r: 280, life: 0.5, max: 0.5, img: GLOW.red }); shake = Math.min(26, shake + 14); stage2Flash = 4.5; break;
         case 'dryfire': dryToast = { txt: e.why.toUpperCase(), life: 1.6 }; break;
+        case 'rockhit':
+          flashes.push({ x: e.x, y: e.y, r: 26, life: 0.12, max: 0.12, img: GLOW.orange });
+          for (let i = 0; i < 5; i++) parts.push({ x: e.x, y: e.y, vx: (Math.random() - 0.5) * 90, vy: (Math.random() - 0.5) * 90, life: 0.5, max: 0.5, k: 'smoke', sz: 3 });
+          break;
+        case 'dmg': {
+          const last = dmgFloats[dmgFloats.length - 1];
+          if (last && last.age < 0.35) { last.amt += e.amt; last.x = e.x; last.y = e.y; }
+          else dmgFloats.push({ x: e.x, y: e.y, amt: e.amt, shield: e.shield, age: 0, life: 1.1 });
+          break;
+        }
+        case 'torplaunch': tpush('TORPEDOES AWAY → ' + Sim.SUBS[e.sub].label, 2.5); break;
+        case 'torphit': tpush('TORPEDO HIT — ' + Sim.SUBS[e.sub].label, 3); break;
+        case 'torpdown': tpush('TORPEDO INTERCEPTED', 2.5); break;
+        case 'ace': tpush(e.cs + ': ACE ★', 4); break;
+        case 'battle': wingPrev = ['', '', '']; frigPrev = [false, false]; stancePrev = ''; ticker = []; dmgFloats = []; balSlow = 0.5; break;
       }
     }
   }
@@ -1384,6 +1464,12 @@ const Render = (() => {
   }
   const rects = { subs: [], squads: [] };
   let wingPrev = ['', '', ''], ticker = [], stage2Flash = 0, frigPrev = [false, false], stancePrev = '', dryToast = null;
+  let dmgFloats = [], subKillFlash = null, balSlow = 0.5;
+  const tpush = (txt, life) => {
+    const l2 = ticker[ticker.length - 1];
+    if (l2 && l2.txt === txt) { l2.life = Math.max(l2.life, life); return; }
+    ticker.push({ txt, life });
+  };
 
   function drawHUD(S, now) {
     sctx.textBaseline = 'alphabetic';
@@ -1523,8 +1609,8 @@ const Render = (() => {
         if (!f.alive) { sctx.fillStyle = '#5a3a3a'; sctx.fillText('✝', fx, yy + 9); return; }
         bar(fx, yy + 1, 24, 6, f.hp / f.max, f.hp / f.max > 0.5 ? '#7fe0a0' : f.hp / f.max > 0.25 ? '#ffd070' : '#ff6a5a');
         sctx.fillStyle = f.repairing ? '#7fe0d8' : '#7d93a8'; sctx.font = '8px Consolas,monospace';
-        sctx.fillText(f.state === 'docked' ? (f.repairing ? Math.round(100 * f.hp / f.max) + '%' : 'BAY') :
-          f.state === 'recall' ? 'RTB' : f.state.slice(0, 3).toUpperCase(), fx, yy + 16);
+        sctx.fillText((f.kills >= 3 ? '★' : '') + (f.state === 'docked' ? (f.repairing ? Math.round(100 * f.hp / f.max) + '%' : 'BAY') :
+          f.state === 'recall' ? 'RTB' : f.state.slice(0, 3).toUpperCase()), fx, yy + 16);
       });
     }
     sctx.fillStyle = 'rgba(140,165,190,0.8)'; sctx.font = '9px Consolas,monospace';
@@ -1546,6 +1632,11 @@ const Render = (() => {
       const [fx2, fy2] = mput(f.x, f.y);
       sctx.fillStyle = f.side === 'P' ? '#7fb8ff' : '#ff8a70';
       sctx.fillRect(fx2 - 1, fy2 - 1, 2, 2);
+    }
+    for (const rk of S.rocks) {
+      const [rx2, ry2] = mput(rk.x, rk.y);
+      sctx.fillStyle = 'rgba(120,130,145,0.3)';
+      sctx.fillRect(rx2 - 1, ry2 - 1, 2, 2);
     }
     for (const fr of S.frigates) {
       if (fr.dead) continue;
@@ -1617,6 +1708,40 @@ const Render = (() => {
       sctx.fillText('SECOND CONTACT — HOSTILE REINFORCEMENT', W / 2, H * 0.3);
       sctx.restore();
     }
+    if (subKillFlash) {
+      subKillFlash.t -= 0.016;
+      if (subKillFlash.t <= 0) subKillFlash = null;
+      else {
+        sctx.save(); sctx.textAlign = 'center';
+        sctx.shadowColor = 'rgba(255,208,112,0.8)'; sctx.shadowBlur = 12;
+        sctx.fillStyle = '#ffe9b0'; sctx.font = 'bold 17px Consolas,monospace';
+        sctx.fillText(subKillFlash.txt, W / 2, H * 0.24);
+        sctx.restore();
+      }
+    }
+    // floating damage numbers: your hits, confirmed
+    dmgFloats = dmgFloats.filter(d2 => (d2.age += 0.016) < d2.life);
+    sctx.textAlign = 'center'; sctx.font = 'bold 12px Consolas,monospace';
+    for (const d2 of dmgFloats) {
+      const a = 1 - d2.age / d2.life;
+      sctx.fillStyle = d2.shield ? 'rgba(255,200,120,' + a.toFixed(2) + ')' : 'rgba(240,248,255,' + a.toFixed(2) + ')';
+      sctx.fillText(Math.round(d2.amt), w2x(d2.x), w2y(d2.y) - 20 - d2.age * 26);
+    }
+    // the balance of battle: one glance, who is winning
+    const matOf = (c, side) => (c.dead ? 0 : c.hull + c.shield * 0.5)
+      + S.fighters.filter(f => f.alive && f.side === side).length * 40
+      + S.frigates.filter(fr => !fr.dead && fr.side === side).length * 150;
+    const pm2 = matOf(P, 'P'), em2 = matOf(E, 'E');
+    const bal = pm2 / Math.max(1, pm2 + em2);
+    balSlow += (bal - balSlow) * 0.016 / 6;
+    const shifted = Math.abs(bal - balSlow) > 0.05;
+    const bmw = 300, bmx2 = W / 2 - bmw / 2, bmy = 10;
+    sctx.fillStyle = 'rgba(6,10,16,0.7)'; sctx.fillRect(bmx2 - 2, bmy - 2, bmw + 4, 10);
+    sctx.fillStyle = shifted && Math.floor(now * 6) % 2 ? 'rgba(150,205,255,0.95)' : 'rgba(95,150,220,0.85)';
+    sctx.fillRect(bmx2, bmy, bmw * bal, 6);
+    sctx.fillStyle = shifted && Math.floor(now * 6) % 2 ? 'rgba(255,150,120,0.95)' : 'rgba(220,90,70,0.85)';
+    sctx.fillRect(bmx2 + bmw * bal, bmy, bmw * (1 - bal), 6);
+    sctx.fillStyle = '#dfe9f5'; sctx.fillRect(bmx2 + bmw * bal - 1, bmy - 1, 2, 8);
 
     // alerts
     sctx.textAlign = 'center';
@@ -1756,7 +1881,8 @@ const Render = (() => {
           + ' · battles ' + rec.battles + ' · wins E' + rec.wins[0] + ' C' + rec.wins[1] + ' A' + rec.wins[2], W / 2, yy + 70);
         sctx.fillStyle = '#7d93a8'; sctx.font = '11px Consolas,monospace';
         sctx.fillText('pilots saved ' + rec.saved + ' · pilots lost ' + rec.lost
-          + (rec.perfect ? ' · ★ perfect battles ' + rec.perfect : ''), W / 2, yy + 86);
+          + (rec.perfect ? ' · ★ perfect battles ' + rec.perfect : '')
+          + (rec.ace ? ' · best ace ' + rec.ace.cs + ' (' + rec.ace.kills + ')' : ''), W / 2, yy + 86);
       }
     } else if (S.mode === 'end') {
       const won = S.winner === 'P';
@@ -1784,6 +1910,10 @@ const Render = (() => {
       if (won && S.escortsHome === 2) {
         sctx.fillStyle = '#9fd0ff'; sctx.font = 'bold 13px Consolas,monospace';
         sctx.fillText('PIKE AND SABRE CAME HOME', W / 2, ey2); ey2 += 20;
+      }
+      if (S.topGun) {
+        sctx.fillStyle = '#ffd070'; sctx.font = 'bold 12px Consolas,monospace';
+        sctx.fillText('TOP GUN: ' + S.topGun.cs + ' — ' + S.topGun.kills + (S.topGun.kills === 1 ? ' kill' : ' kills'), W / 2, ey2); ey2 += 20;
       }
       const nr = Sim.nextRank(S.record.best);
       sctx.fillStyle = '#8fa4b8'; sctx.font = '11px Consolas,monospace';
@@ -1829,6 +1959,24 @@ const Render = (() => {
       g.fillRect(sx, sy, st.z > 0.5 ? 1.6 : 1, st.z > 0.5 ? 1.6 : 1);
     }
 
+    // the belt: slow-tumbling debris, drawn under everything that flies
+    for (const rk of S.rocks) {
+      const x = w2x(rk.x), y = w2y(rk.y), rr2 = rk.r * scale;
+      if (x < -90 || x > W + 90 || y < -90 || y > H + 90) continue;
+      g.save(); g.translate(x, y); g.rotate(rk.seed + now * rk.vr);
+      g.beginPath();
+      for (let i = 0; i < 9; i++) {
+        const a = i / 9 * TAU;
+        const rj = rr2 * (0.72 + 0.28 * Math.abs(Math.sin(rk.seed * 3 + i * 2.7)));
+        i ? g.lineTo(Math.cos(a) * rj, Math.sin(a) * rj) : g.moveTo(Math.cos(a) * rj, Math.sin(a) * rj);
+      }
+      g.closePath();
+      g.fillStyle = '#1b2028'; g.fill();
+      g.strokeStyle = '#0d1117'; g.lineWidth = 1.5; g.stroke();
+      g.fillStyle = 'rgba(85,95,110,0.13)';
+      g.beginPath(); g.arc(-rr2 * 0.25, -rr2 * 0.3, rr2 * 0.45, 0, TAU); g.fill();
+      g.restore();
+    }
     // broadside wedges: the one rule of the guns, drawn on the battlefield
     if (S.mode === 'play' && !P.dead && S.stats.broadsides < 10 && !P.subs.weapons.disabled) {
       const inArc = Sim.canBroadside(P);
@@ -1969,7 +2117,7 @@ const Render = (() => {
 
 /* =========================== [4] AUDIO =========================== */
 const Audio2 = (() => {
-  let ac = null, master = null, noiseBuf = null, tension = null, drone = null;
+  let ac = null, master = null, noiseBuf = null, tension = null, drone = null, gunEcho = null;
   const satCurve = (() => { const n = 256, c = new Float32Array(n); for (let i = 0; i < n; i++) { const x = i / (n - 1) * 2 - 1; c[i] = Math.tanh(2.5 * x); } return c; })();
   function ensure() {
     if (!ac) {
@@ -1979,6 +2127,13 @@ const Audio2 = (() => {
         comp.threshold.value = -18; comp.ratio.value = 5; comp.attack.value = 0.003; comp.release.value = 0.2;
         comp.connect(ac.destination);
         master = ac.createGain(); master.gain.value = 0.5; master.connect(comp);
+        // gun echo: a short damped feedback tail that makes the guns feel huge
+        gunEcho = ac.createDelay(0.5); gunEcho.delayTime.value = 0.09;
+        const efb = ac.createGain(); efb.gain.value = 0.32;
+        const edamp = ac.createBiquadFilter(); edamp.type = 'lowpass'; edamp.frequency.value = 2200;
+        gunEcho.connect(edamp); edamp.connect(efb); efb.connect(gunEcho);
+        const eout = ac.createGain(); eout.gain.value = 0.45;
+        edamp.connect(eout); eout.connect(master);
         noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
         const d = noiseBuf.getChannelData(0);
         for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
@@ -2020,22 +2175,33 @@ const Audio2 = (() => {
     gn.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
     src.connect(fl); fl.connect(gn); gn.connect(out(pan)); src.start(); src.stop(ac.currentTime + dur);
   }
-  function cannon(pan) {   // the proven mk3 recipe: dive whine through soft-clip + sub
+  function cannon(pan, deep) {   // full mk3: KSSH attack, vibrato dive, soft-clip body, sub, echo
     if (!ac) return;
     const t0 = ac.currentTime, dest = out(pan);
+    const pv = (deep ? 0.62 : 0.94) + Math.random() * 0.1;
     const clip = ac.createWaveShaper(); clip.curve = satCurve;
-    const cg = ac.createGain(); cg.gain.value = 0.8; clip.connect(cg); cg.connect(dest);
-    const zap = (type, f0, f1, dur, vol) => {
+    const cg = ac.createGain(); cg.gain.value = deep ? 0.7 : 0.9;
+    clip.connect(cg); cg.connect(dest);
+    if (gunEcho) cg.connect(gunEcho);
+    const zap = (type, f0, f1, dur, vol, vib) => {
       const o = ac.createOscillator(), gn = ac.createGain();
-      o.type = type; o.frequency.setValueAtTime(f0, t0);
-      o.frequency.exponentialRampToValueAtTime(f1, t0 + dur);
+      o.type = type;
+      o.frequency.setValueAtTime(f0 * pv, t0);
+      o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t0 + dur);
+      if (vib) {
+        const lf = ac.createOscillator(), lg = ac.createGain();
+        lf.frequency.value = 42; lg.gain.value = f0 * 0.12;
+        lf.connect(lg); lg.connect(o.frequency);
+        lf.start(t0); lf.stop(t0 + dur);
+      }
       gn.gain.setValueAtTime(vol, t0);
       gn.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       o.connect(gn); gn.connect(clip); o.start(t0); o.stop(t0 + dur + 0.02);
     };
-    zap('sawtooth', 900, 70, 0.3, 0.16); zap('square', 420, 55, 0.22, 0.07);
-    blip(110, 0.25, 'sine', 0.26, 34, pan);
-    noise(0.08, 0.14, 4500, 800, pan);
+    zap('sawtooth', 2100, deep ? 90 : 150, deep ? 0.4 : 0.28, 0.15, true);   // the dive
+    zap('square', 1050, deep ? 55 : 80, deep ? 0.3 : 0.2, 0.07, false);      // body
+    blip(deep ? 88 : 130, deep ? 0.34 : 0.24, 'sine', deep ? 0.3 : 0.26, deep ? 26 : 40, pan);  // sub punch
+    noise(0.07, deep ? 0.1 : 0.15, 6200, 1000, pan);                          // KSSH attack
   }
   function handle(evts, S) {
     if (!ac) return;
@@ -2045,15 +2211,26 @@ const Audio2 = (() => {
       switch (e.type) {
         case 'pew': blip(e.side === 'P' ? 620 : 480, 0.05, 'square', 0.018, 240, pan); break;
         case 'pd': if (Math.random() < 0.35) blip(1400, 0.03, 'square', 0.014, 700, pan); break;
-        case 'broadside': cannon(pan); break;
-        case 'spinal': blip(90, 0.5, 'sine', 0.3, 26, pan); noise(0.45, 0.2, 500, 60, pan); break;
+        case 'broadside': cannon(pan, e.side === 'E'); break;
+        case 'spinal':
+          if (e.side === 'P') {   // mechanical launch: thunk, hydraulics, drive whoosh
+            blip(64, 0.12, 'square', 0.16, 40, pan);
+            noise(0.4, 0.22, 900, 110, pan);
+            blip(180, 0.55, 'triangle', 0.06, 38, pan);
+          } else { blip(90, 0.5, 'sine', 0.3, 26, pan); noise(0.45, 0.2, 500, 60, pan); }
+          break;
+        case 'ace': blip(1046, 0.16, 'sine', 0.07); blip(1568, 0.3, 'sine', 0.07); break;
+        case 'rockhit': if (Math.random() < 0.6) noise(0.2, 0.1, 700, 90, pan); break;
         case 'msl': noise(0.5, 0.16, 600, 3000, pan); blip(340, 0.3, 'triangle', 0.06, 900, pan); break;
         case 'wmgcharge': blip(70, 2.2, 'sawtooth', 0.08, 950); break;
         case 'wmgfire': noise(2.2, 0.55, 1400, 40); blip(30, 2.6, 'sine', 0.45, 16); blip(220, 1.2, 'sawtooth', 0.12, 30); break;
         case 'boom': noise(e.big ? 1.6 : 0.5, e.big ? 0.5 : 0.22, 900, 45, pan); if (e.big) blip(60, 1.2, 'sine', 0.3, 24, pan); break;
         case 'shield': blip(900, 0.08, 'triangle', 0.05, 500, pan); break;
         case 'armorhit': noise(0.1, 0.06, 900, 200, pan); break;
-        case 'subdown': blip(880, 0.5, 'square', 0.09, 870); blip(660, 0.7, 'square', 0.09, 650); break;   // two-tone alarm
+        case 'subdown':
+          blip(880, 0.5, 'square', 0.09, 870); blip(660, 0.7, 'square', 0.09, 650);   // two-tone alarm
+          if (e.side === 'E') { noise(1.2, 0.4, 700, 40, pan); blip(50, 1.0, 'sine', 0.3, 20, pan); }   // your kill: a real thump
+          break;
         case 'subup': blip(520, 0.2, 'sine', 0.06, 780); break;
         case 'dock': blip(700, 0.12, 'sine', 0.06, 1050, pan); break;
         case 'rtb': blip(420, 0.14, 'sine', 0.04, 300, pan); break;
